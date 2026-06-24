@@ -1,0 +1,12 @@
+build/
+install/
+log/
+PCD/
+calibration_logs/
+.agents/
+.codex/
+
+# Local editor and OS noise.
+.DS_Store
+*.swp
+*.swo

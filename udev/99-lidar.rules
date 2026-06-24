@@ -1,0 +1,2 @@
+# 当前 ttyACM0 对应的雷达，固定命名为 /dev/lidar
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55e9", ATTRS{serial}=="BC483CB9ABCDA4CE", MODE:="0666", SYMLINK+="lidar"

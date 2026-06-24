@@ -1,0 +1,47 @@
+demo_relocalign:
+  ros__parameters:
+    align_method: "VGICP"
+    voxelgrid_leaf: 0.1
+
+    # PCL ICP 参数
+    pcl_icp:
+      max_iterations: 50
+      max_correspondence_distance: 1.0
+      transformation_epsilon: 1e-6
+      euclidean_fitness_epsilon: 1e-6
+      use_reciprocal_correspondences: true
+
+    # PCL NDT 参数
+    pcl_ndt:
+      step_size: 0.1
+      transformation_epsilon: 1e-6
+      max_iterations: 40
+
+    # GICP 参数
+    gicp:
+      k_correspondences: 20
+      max_correspondence_distance: 2.0
+      num_threads: 8
+
+    # VGICP 参数
+    vgicp:
+      k_correspondences: 20
+      voxel_resolution: 1.0
+      neighbor_search_method: "DIRECT27"
+      num_threads: 8
+
+    # VGICP CUDA 参数
+    vgicp_cuda:
+      k_correspondences: 15
+      voxel_resolution: 1.0
+      neighbor_search_method: "DIRECT1"
+      neighbor_search_radius: 1.5
+      nearest_neighbor_method: "GPU_RBF_KERNEL"
+      kernel_width: 0.5
+
+    # NDT CUDA 参数
+    ndt_cuda:
+      voxel_resolution: 1.0
+      neighbor_search_method: "DIRECT1"
+      neighbor_search_radius: 1.5
+      ndt_distance_mode: "P2D"
