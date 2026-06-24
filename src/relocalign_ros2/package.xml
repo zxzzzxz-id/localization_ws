@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>relocalign_ros2</name>
+  <version>0.1.0</version>
+  <description>ROS2 wrapper for relocalign core library</description>
+
+  <maintainer email="you@example.com">you</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>livox_ros_driver2</depend>
+  <depend>pcl_msgs</depend>
+  <!-- 点云转换：ROS2 下常用 pcl_conversions/pcl_ros (具体依发行版/包情况) -->
+  <depend>pcl_conversions</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

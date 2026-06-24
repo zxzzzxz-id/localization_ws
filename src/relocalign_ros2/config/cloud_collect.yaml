@@ -1,0 +1,5 @@
+cloud_collect:
+  ros__parameters:
+    cloud_topic: "/livox/lidar"
+    is_livox_custom: false
+    pcd_path: "/tmp/cloud_collect.pcd"
