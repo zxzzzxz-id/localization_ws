@@ -5,6 +5,8 @@ PCD/
 calibration_logs/
 .agents/
 .codex/
+.vscode
+.dsh
 
 # Local editor and OS noise.
 .DS_Store
