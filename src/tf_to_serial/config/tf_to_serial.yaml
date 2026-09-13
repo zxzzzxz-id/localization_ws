@@ -1,0 +1,32 @@
+tf_to_serial_fastlio:
+  ros__parameters:
+    # Serial transport
+    serial_port: "/dev/my_lidar"
+    baudrate: 115200
+    serial_timeout_ms: 1000
+    serial_retry_interval_ms: 1000
+    publish_rate_hz: 200.0
+    high_freq_info_enabled: false
+
+    # FAST-LIO TF source
+    world_frame: "odom"
+    body_frame: "base_link_hf"
+
+    # Robot-frame extrinsics and pose calibration are owned by
+    # FAST-LIO/config/mapping/mid360.yaml. This node only serializes the
+    # already transformed odom -> base_link_hf pose.
+    delta_dis_threshold: 0.2
+    delta_angle_threshold: 0.2
+
+    # Packet format (keep these defaults unless the receiver protocol changes).
+    # Byte order for all five float fields is the host's IEEE-754 little-endian order.
+    # Layout: FF FE 01 | x | y | z | yaw | pitch | AA DD
+    tx_header: [0xFF, 0xFE, 0x01]
+    tx_tail: [0xAA, 0xDD]
+    tx_position_scale: 1000.0  # ! meters -> millimeters
+
+    # Passive restart packet: FF FE 01 78 13 AA DD
+    restart_magic: [0xFF, 0xFE, 0x01, 0x78, 0x13, 0xAA, 0xDD]
+
+    # Do not put restart_command here. It is supplied by POSTION_ODOM_RESTART_CMD
+    # or explicitly with -p restart_command:=... at launch time.

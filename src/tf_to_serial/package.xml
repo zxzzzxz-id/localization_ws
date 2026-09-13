@@ -3,7 +3,7 @@
 <package format="3">
   <name>tf_to_serial</name>
   <version>0.0.0</version>
-  <description>TF to Serial for ROS2</description>
+  <description>FAST-LIO TF pose sender with serial-triggered restart support.</description>
   <maintainer email="user@todo.todo">user</maintainer>
   <license>Apache-2.0</license>
 
@@ -18,4 +18,4 @@
   <export>
     <build_type>ament_cmake</build_type>
   </export>
-</package> 
+</package>

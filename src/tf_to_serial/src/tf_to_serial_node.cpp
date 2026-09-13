@@ -7,30 +7,31 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Vector3.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstddef>
+#include <cstdint>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
+#include <sys/wait.h>
 
 namespace {
 
-constexpr double MID360_IMU2LIDAR_X = 0.011;
-constexpr double MID360_IMU2LIDAR_Y = 0.02329;
-constexpr double MID360_IMU2LIDAR_Z = -0.04412;
-constexpr double LIDAR2ROBOT_Z = 0.50;
-constexpr int WARMUP_FRAMES = 20;
 constexpr std::size_t kFrameFloatCount = 5;
-constexpr std::size_t kFrameSize = 3 + kFrameFloatCount * sizeof(float) + 2;
-constexpr uint8_t kFrameHeader0 = 0xFF;
-constexpr uint8_t kFrameHeader1 = 0xFE;
-constexpr uint8_t kFrameHeader2 = 0x01;
-constexpr uint8_t kFrameTail0 = 0xAA;
-constexpr uint8_t kFrameTail1 = 0xDD;
+constexpr std::array<uint8_t, 3> kDefaultFrameHeader = {0xFF, 0xFE, 0x01};
+constexpr std::array<uint8_t, 2> kDefaultFrameTail = {0xAA, 0xDD};
+constexpr std::array<uint8_t, 7> kDefaultRestartMagic = {
+    0xFF, 0xFE, 0x01, 0x78, 0x13, 0xAA, 0xDD};
+constexpr std::size_t kFrameSize =
+    kDefaultFrameHeader.size() + kFrameFloatCount * sizeof(float) + kDefaultFrameTail.size();
+static_assert(kFrameSize == 25, "The receiver protocol requires a 25-byte packet.");
 
 double wrapTo180(double ang_deg) {
     ang_deg = std::fmod(ang_deg + 180.0, 360.0);
@@ -52,29 +53,38 @@ void appendFloat(std::vector<uint8_t>& frame, float value) {
     }
 }
 
-double computeSendValue(
-    double current_value,
-    double anchor_value,
-    double target_value,
-    double base_offset,
-    bool anchor_valid) {
-    if (!anchor_valid) {
-        return current_value + base_offset;
-    }
-    return current_value - anchor_value + target_value + base_offset;
+std::string getEnvString(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::string(value) : std::string();
 }
 
-double computeSendYawDeg(
-    double current_yaw_deg,
-    double anchor_yaw_deg,
-    double target_yaw_deg,
-    double base_offset_yaw_deg,
-    bool anchor_valid) {
-    if (!anchor_valid) {
-        return wrapTo180(current_yaw_deg + base_offset_yaw_deg);
+template <std::size_t N>
+bool assignByteArray(
+    const std::vector<int64_t>& values,
+    std::array<uint8_t, N>& destination) {
+    if (values.size() != N) {
+        return false;
     }
-    const double delta_yaw_deg = shortestAngleDeltaDeg(current_yaw_deg, anchor_yaw_deg);
-    return wrapTo180(target_yaw_deg + delta_yaw_deg + base_offset_yaw_deg);
+
+    for (std::size_t i = 0; i < N; ++i) {
+        if (values[i] < 0 || values[i] > 0xFF) {
+            return false;
+        }
+        destination[i] = static_cast<uint8_t>(values[i]);
+    }
+    return true;
+}
+
+bool containsSequence(
+    const std::vector<uint8_t>& buffer,
+    const std::array<uint8_t, 7>& sequence) {
+    if (buffer.size() < sequence.size()) {
+        return false;
+    }
+
+    return std::search(
+               buffer.begin(), buffer.end(),
+               sequence.begin(), sequence.end()) != buffer.end();
 }
 
 }  // namespace
@@ -83,37 +93,79 @@ class TfToSerialNode : public rclcpp::Node {
 public:
     TfToSerialNode()
         : Node("tf_to_serial_fastlio") {
-        serial_port_ = declare_parameter<std::string>("serial_port", "/dev/lidar");
+        serial_port_ = declare_parameter<std::string>("serial_port", "/dev/my_lidar");
         baudrate_ = declare_parameter<int>("baudrate", 115200);
-        world_frame_ = declare_parameter<std::string>("world_frame", "camera_init");
-        body_frame_ = declare_parameter<std::string>("body_frame", "body_hf");
-        fix_roll_deg_ = declare_parameter<double>("fix_roll_deg", -21.30);
-        fix_pitch_deg_ = declare_parameter<double>("fix_pitch_deg", 0.0);
-        fix_yaw_deg_ = declare_parameter<double>("fix_yaw_deg", 0.0);
-        xy_rotation_deg_ = declare_parameter<double>("xy_rotation_deg", 90.0);
-        lidar2robot_dis_ = declare_parameter<double>("lidar2robot_dis", 0.31076);
-        lidar2robot_ang_ = declare_parameter<double>("lidar2robot_ang", -180.0);
+        serial_timeout_ms_ = declare_parameter<int>("serial_timeout_ms", 1000);
+        serial_retry_interval_ms_ = declare_parameter<int>("serial_retry_interval_ms", 1000);
+        world_frame_ = declare_parameter<std::string>("world_frame", "odom");
+        body_frame_ = declare_parameter<std::string>("body_frame", "base_link_hf");
         delta_dis_threshold_ = declare_parameter<double>("delta_dis_threshold", 0.2);
         delta_angle_threshold_ = declare_parameter<double>("delta_angle_threshold", 0.2);
         publish_rate_hz_ = declare_parameter<double>("publish_rate_hz", 200.0);
-        base_offset_x_ = declare_parameter<double>("base_offset_x", 0.0);
-        base_offset_y_ = declare_parameter<double>("base_offset_y", 0.0);
-        base_offset_z_ = declare_parameter<double>("base_offset_z", 0.0);
-        base_offset_yaw_deg_ = declare_parameter<double>("base_offset_yaw_deg", 90.0);
-        base_offset_pitch_deg_ = declare_parameter<double>("base_offset_pitch_deg", 0.0);
+        high_freq_info_enabled_ = declare_parameter<bool>("high_freq_info_enabled", false);
+        restart_command_ = declare_parameter<std::string>(
+            "restart_command",
+            getEnvString("POSTION_ODOM_RESTART_CMD"));
+        tx_position_scale_ = declare_parameter<double>("tx_position_scale", 1000.0);
 
+        const auto tx_header = declare_parameter<std::vector<int64_t>>(
+            "tx_header", std::vector<int64_t>{0xFF, 0xFE, 0x01});
+        const auto tx_tail = declare_parameter<std::vector<int64_t>>(
+            "tx_tail", std::vector<int64_t>{0xAA, 0xDD});
+        const auto restart_magic = declare_parameter<std::vector<int64_t>>(
+            "restart_magic", std::vector<int64_t>{0xFF, 0xFE, 0x01, 0x78, 0x13, 0xAA, 0xDD});
+
+        if (!assignByteArray(tx_header, tx_header_)) {
+            RCLCPP_WARN(get_logger(), "tx_header must contain exactly three bytes; using FF FE 01.");
+            tx_header_ = kDefaultFrameHeader;
+        }
+        if (!assignByteArray(tx_tail, tx_tail_)) {
+            RCLCPP_WARN(get_logger(), "tx_tail must contain exactly two bytes; using AA DD.");
+            tx_tail_ = kDefaultFrameTail;
+        }
+        if (!assignByteArray(restart_magic, restart_magic_)) {
+            RCLCPP_WARN(
+                get_logger(),
+                "restart_magic must contain exactly seven bytes; using FF FE 01 78 13 AA DD.");
+            restart_magic_ = kDefaultRestartMagic;
+        }
         if (publish_rate_hz_ <= 0.0) {
             RCLCPP_WARN(get_logger(), "publish_rate_hz must be > 0. Forcing to 200.0");
             publish_rate_hz_ = 200.0;
         }
-
+        if (baudrate_ <= 0) {
+            RCLCPP_WARN(get_logger(), "baudrate must be > 0. Forcing to 115200.");
+            baudrate_ = 115200;
+        }
+        if (serial_timeout_ms_ <= 0) {
+            RCLCPP_WARN(get_logger(), "serial_timeout_ms must be > 0. Forcing to 1000.");
+            serial_timeout_ms_ = 1000;
+        }
+        if (serial_retry_interval_ms_ <= 0) {
+            RCLCPP_WARN(get_logger(), "serial_retry_interval_ms must be > 0. Forcing to 1000.");
+            serial_retry_interval_ms_ = 1000;
+        }
+        if (!std::isfinite(tx_position_scale_) || tx_position_scale_ <= 0.0) {
+            RCLCPP_WARN(get_logger(), "tx_position_scale must be finite and > 0. Forcing to 1000.");
+            tx_position_scale_ = 1000.0;
+        }
+        if (!std::isfinite(delta_dis_threshold_) || delta_dis_threshold_ < 0.0) {
+            RCLCPP_WARN(get_logger(), "delta_dis_threshold must be finite and >= 0. Forcing to 0.2.");
+            delta_dis_threshold_ = 0.2;
+        }
+        if (!std::isfinite(delta_angle_threshold_) || delta_angle_threshold_ < 0.0) {
+            RCLCPP_WARN(get_logger(), "delta_angle_threshold must be finite and >= 0. Forcing to 0.2.");
+            delta_angle_threshold_ = 0.2;
+        }
+        if (serial_port_.empty()) {
+            throw std::invalid_argument("serial_port must not be empty");
+        }
+        if (world_frame_.empty() || body_frame_.empty() || world_frame_ == body_frame_ ||
+            world_frame_.front() == '/' || body_frame_.front() == '/') {
+            throw std::invalid_argument(
+                "world_frame and body_frame must be distinct, non-empty TF names without leading '/'");
+        }
         openSerial();
-
-        q_fix_.setRPY(
-            fix_roll_deg_ * M_PI / 180.0,
-            fix_pitch_deg_ * M_PI / 180.0,
-            fix_yaw_deg_ * M_PI / 180.0);
-        q_fix_.normalize();
 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -126,18 +178,16 @@ public:
         RCLCPP_INFO(get_logger(), "tf_to_serial_fastlio started.");
         RCLCPP_INFO(get_logger(), "  serial_port: %s", serial_port_.c_str());
         RCLCPP_INFO(get_logger(), "  baudrate: %d", baudrate_);
+        RCLCPP_INFO(get_logger(), "  serial_timeout_ms: %d", serial_timeout_ms_);
+        RCLCPP_INFO(get_logger(), "  serial_retry_interval_ms: %d", serial_retry_interval_ms_);
         RCLCPP_INFO(get_logger(), "  world_frame: %s", world_frame_.c_str());
         RCLCPP_INFO(get_logger(), "  body_frame: %s", body_frame_.c_str());
-        RCLCPP_INFO(get_logger(), "  fix_rpy_deg: %.4f, %.4f, %.4f",
-                    fix_roll_deg_, fix_pitch_deg_, fix_yaw_deg_);
-        RCLCPP_INFO(get_logger(), "  xy_rotation_deg: %.4f", xy_rotation_deg_);
-        RCLCPP_INFO(get_logger(), "  lidar2robot_dis: %.6f", lidar2robot_dis_);
-        RCLCPP_INFO(get_logger(), "  lidar2robot_ang: %.4f", lidar2robot_ang_);
         RCLCPP_INFO(get_logger(), "  publish_rate_hz: %.2f", publish_rate_hz_);
-        RCLCPP_INFO(get_logger(), "  base_offset_xyz: %.3f, %.3f, %.3f",
-                    base_offset_x_, base_offset_y_, base_offset_z_);
-        RCLCPP_INFO(get_logger(), "  base_offset_yaw_pitch_deg: %.3f, %.3f",
-                    base_offset_yaw_deg_, base_offset_pitch_deg_);
+        RCLCPP_INFO(get_logger(), "  high_freq_info_enabled: %s",
+                    high_freq_info_enabled_ ? "true" : "false");
+        RCLCPP_INFO(get_logger(), "  restart_command: %s",
+                    restart_command_.empty() ? "<empty>" : restart_command_.c_str());
+        RCLCPP_INFO(get_logger(), "  tx_position_scale: %.3f", tx_position_scale_);
     }
 
     ~TfToSerialNode() {
@@ -152,7 +202,7 @@ private:
         if (serial_open_ && ser_.isOpen()) {
             return;
         }
-        if (now - last_serial_attempt_ < serial_retry_interval_) {
+        if (now - last_serial_attempt_ < std::chrono::milliseconds(serial_retry_interval_ms_)) {
             return;
         }
         last_serial_attempt_ = now;
@@ -163,7 +213,8 @@ private:
             }
             ser_.setPort(serial_port_);
             ser_.setBaudrate(static_cast<uint32_t>(baudrate_));
-            serial::Timeout timeout = serial::Timeout::simpleTimeout(1000);
+            serial::Timeout timeout = serial::Timeout::simpleTimeout(
+                static_cast<uint32_t>(serial_timeout_ms_));
             ser_.setTimeout(timeout);
             ser_.open();
             serial_open_ = true;
@@ -214,86 +265,57 @@ private:
         }
     }
 
-    void processSerialOffsetFrames(
-        double current_x,
-        double current_y,
-        double current_z,
-        double current_yaw_deg,
-        double current_pitch_deg) {
-        while (rx_buffer_.size() >= kFrameSize) {
-            const std::size_t header_pos = findFrameHeader(rx_buffer_);
-            if (header_pos == std::string::npos) {
-                if (rx_buffer_.size() > 2) {
-                    rx_buffer_.erase(rx_buffer_.begin(), rx_buffer_.end() - 2);
-                }
-                return;
-            }
+    void requestRestartIfNeeded() {
+        if (restart_requested_) {
+            return;
+        }
 
-            if (header_pos > 0) {
+        if (!containsSequence(rx_buffer_, restart_magic_)) {
+            // Preserve a magic-frame prefix split across reads, but never retain an
+            // unbounded amount of unrelated incoming data.
+            constexpr std::size_t kBytesToKeep = kDefaultRestartMagic.size() - 1;
+            if (rx_buffer_.size() > kBytesToKeep) {
                 rx_buffer_.erase(
                     rx_buffer_.begin(),
-                    rx_buffer_.begin() + static_cast<std::ptrdiff_t>(header_pos));
+                    rx_buffer_.end() - static_cast<std::ptrdiff_t>(kBytesToKeep));
             }
+            return;
+        }
 
-            if (rx_buffer_.size() < kFrameSize) {
-                return;
-            }
+        rx_buffer_.clear();
 
-            if (!isFrameTailValid(rx_buffer_)) {
-                rx_buffer_.erase(rx_buffer_.begin());
-                continue;
-            }
+        RCLCPP_WARN(
+            get_logger(),
+            "Received configured restart magic frame, requesting postion_odom restart.");
 
-            std::array<double, kFrameFloatCount> targets = {};
-            for (std::size_t i = 0; i < kFrameFloatCount; ++i) {
-                float value = 0.0f;
-                std::memcpy(
-                    &value,
-                    rx_buffer_.data() + 3 + i * sizeof(float),
-                    sizeof(float));
-                targets[i] = static_cast<double>(value);
-            }
+        if (restart_command_.empty()) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "restart_command parameter is empty, cannot restart postion_odom.sh automatically.");
+            return;
+        }
 
-            serial_anchor_x_ = current_x;
-            serial_anchor_y_ = current_y;
-            serial_anchor_z_ = current_z;
-            serial_anchor_yaw_deg_ = current_yaw_deg;
-            serial_anchor_pitch_deg_ = current_pitch_deg;
-            serial_target_x_ = targets[0];
-            serial_target_y_ = targets[1];
-            serial_target_z_ = targets[2];
-            serial_target_yaw_deg_ = targets[3];
-            serial_target_pitch_deg_ = targets[4];
-            serial_anchor_valid_ = true;
-            serial_anchor_updated_ = true;
+        const std::string detached_command = "gnome-terminal -- bash -lc \"" + restart_command_ + " </dev/null >/tmp/postion_odom_restart.log 2>&1\"";
+        const int rc = std::system(detached_command.c_str());
+        if (rc == -1) {
+            RCLCPP_ERROR(
+                get_logger(),
+                "Failed to invoke restart command: %s",
+                detached_command.c_str());
+            return;
+        }
 
+        if (WIFEXITED(rc) && WEXITSTATUS(rc) == 0) {
+            restart_requested_ = true;
             RCLCPP_INFO(
                 get_logger(),
-                "Received target frame: x=%.3f y=%.3f z=%.3f yaw=%.3f pitch=%.3f",
-                serial_target_x_, serial_target_y_, serial_target_z_,
-                serial_target_yaw_deg_, serial_target_pitch_deg_);
-
-            rx_buffer_.erase(
-                rx_buffer_.begin(),
-                rx_buffer_.begin() + static_cast<std::ptrdiff_t>(kFrameSize));
+                "Restart command launched successfully. Log: /tmp/postion_odom_restart.log");
+        } else {
+            RCLCPP_ERROR(
+                get_logger(),
+                "Restart command returned non-zero status: raw=%d cmd=%s",
+                rc, detached_command.c_str());
         }
-    }
-
-    static std::size_t findFrameHeader(const std::vector<uint8_t>& buffer) {
-        for (std::size_t i = 0; i + 2 < buffer.size(); ++i) {
-            if (buffer[i] == kFrameHeader0 &&
-                buffer[i + 1] == kFrameHeader1 &&
-                buffer[i + 2] == kFrameHeader2) {
-                return i;
-            }
-        }
-        return std::string::npos;
-    }
-
-    static bool isFrameTailValid(const std::vector<uint8_t>& buffer) {
-        return buffer.size() >= kFrameSize &&
-               buffer[kFrameSize - 2] == kFrameTail0 &&
-               buffer[kFrameSize - 1] == kFrameTail1;
     }
 
     void timerCallback() {
@@ -303,6 +325,11 @@ private:
             }
 
             drainSerialBytes();
+            requestRestartIfNeeded();
+            if (restart_requested_) {
+                rclcpp::shutdown();
+                return;
+            }
 
             const geometry_msgs::msg::TransformStamped transform_stamped =
                 tf_buffer_->lookupTransform(world_frame_, body_frame_, tf2::TimePointZero);
@@ -317,143 +344,24 @@ private:
                 transform_stamped.transform.rotation.z,
                 transform_stamped.transform.rotation.w);
 
-            tf2::Quaternion q_leveled = q_fix_ * q;
-            q_leveled.normalize();
+            double roll = 0.0;
+            double pitch = 0.0;
+            double yaw = 0.0;
+            tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
 
-            double roll_leveled = 0.0;
-            double pitch_leveled = 0.0;
-            double yaw_leveled = 0.0;
-            tf2::Matrix3x3(q_leveled).getRPY(roll_leveled, pitch_leveled, yaw_leveled);
+            // FAST-LIO already publishes robot-centered, zero-origin odometry.
+            // Serialize that TF directly so this node never creates a second origin.
+            const double send_x = raw_x;
+            const double send_y = raw_y;
+            const double send_z = raw_z;
+            const double current_roll_deg = wrapTo180(roll * 180.0 / M_PI);
+            const double send_pitch_deg = wrapTo180(pitch * 180.0 / M_PI);
+            const double send_yaw_deg = wrapTo180(yaw * 180.0 / M_PI);
 
-            if (count_ < WARMUP_FRAMES) {
-                sum_x_ += raw_x;
-                sum_y_ += raw_y;
-                sum_z_ += raw_z;
-                sum_sin_roll_leveled_ += std::sin(roll_leveled);
-                sum_cos_roll_leveled_ += std::cos(roll_leveled);
-                sum_sin_pitch_leveled_ += std::sin(pitch_leveled);
-                sum_cos_pitch_leveled_ += std::cos(pitch_leveled);
-                sum_sin_yaw_leveled_ += std::sin(yaw_leveled);
-                sum_cos_yaw_leveled_ += std::cos(yaw_leveled);
-                ++count_;
-                RCLCPP_INFO_THROTTLE(
-                    get_logger(), *get_clock(), 500,
-                    "Warming up... (%d/%d)", count_, WARMUP_FRAMES);
-                return;
-            }
-
-            if (!averaged_) {
-                avg_x_ = sum_x_ / WARMUP_FRAMES;
-                avg_y_ = sum_y_ / WARMUP_FRAMES;
-                avg_z_ = sum_z_ / WARMUP_FRAMES;
-                avg_roll_leveled_ = std::atan2(
-                    sum_sin_roll_leveled_ / WARMUP_FRAMES,
-                    sum_cos_roll_leveled_ / WARMUP_FRAMES);
-                avg_pitch_leveled_ = std::atan2(
-                    sum_sin_pitch_leveled_ / WARMUP_FRAMES,
-                    sum_cos_pitch_leveled_ / WARMUP_FRAMES);
-                avg_yaw_leveled_ = std::atan2(
-                    sum_sin_yaw_leveled_ / WARMUP_FRAMES,
-                    sum_cos_yaw_leveled_ / WARMUP_FRAMES);
-                averaged_ = true;
-
-                RCLCPP_INFO(
-                    get_logger(),
-                    "Warmup done. avg_pos=(%.3f, %.3f, %.3f) avg_leveled_rpy=(roll=%.2f deg, pitch=%.2f deg, yaw=%.2f deg)",
-                    avg_x_, avg_y_, avg_z_,
-                    avg_roll_leveled_ * 180.0 / M_PI,
-                    avg_pitch_leveled_ * 180.0 / M_PI,
-                    avg_yaw_leveled_ * 180.0 / M_PI);
-            }
-
-            const double x = raw_x - avg_x_;
-            const double y = raw_y - avg_y_;
-            const double z = raw_z - avg_z_;
-
-            const tf2::Vector3 t_li(
-                MID360_IMU2LIDAR_X,
-                MID360_IMU2LIDAR_Y,
-                MID360_IMU2LIDAR_Z);
-            const tf2::Vector3 correction = tf2::quatRotate(q, t_li);
-
-            const double x_imu2lidar_local = x - correction.x();
-            const double y_imu2lidar_local = y - correction.y();
-            const double z_imu2lidar_local = z - correction.z();
-
-            tf2::Vector3 p_vec(x_imu2lidar_local, y_imu2lidar_local, z_imu2lidar_local);
-            p_vec = tf2::quatRotate(q_fix_, p_vec);
-
-            x_imu2lidar_ = p_vec.x();
-            y_imu2lidar_ = p_vec.y();
-            z_imu2lidar_ = p_vec.z();
-
-            const double roll_out = roll_leveled - avg_roll_leveled_;
-            const double pitch_out = pitch_leveled - avg_pitch_leveled_;
-            const double yaw_out = yaw_leveled - avg_yaw_leveled_;
-
-            const double current_roll_deg = roll_out * 180.0 / M_PI;
-            const double current_pitch_deg = pitch_out * 180.0 / M_PI;
-            double current_yaw_deg = yaw_out * 180.0 / M_PI;
-            current_yaw_deg = wrapTo180(current_yaw_deg);
-
-            processSerialOffsetFrames(
-                x_lidar2robot_,
-                y_lidar2robot_,
-                z_lidar2robot_,
-                current_yaw_deg,
-                current_pitch_deg);
-
-            const double send_x = computeSendValue(
-                x_lidar2robot_, serial_anchor_x_, serial_target_x_, base_offset_x_, serial_anchor_valid_);
-            const double send_y = computeSendValue(
-                y_lidar2robot_, serial_anchor_y_, serial_target_y_, base_offset_y_, serial_anchor_valid_);
-            const double send_z = computeSendValue(
-                z_lidar2robot_, serial_anchor_z_, serial_target_z_, base_offset_z_, serial_anchor_valid_);
-            const double send_pitch_deg = computeSendValue(
-                current_pitch_deg, serial_anchor_pitch_deg_, serial_target_pitch_deg_,
-                base_offset_pitch_deg_, serial_anchor_valid_);
-            const double send_yaw_deg = computeSendYawDeg(
-                current_yaw_deg, serial_anchor_yaw_deg_, serial_target_yaw_deg_,
-                base_offset_yaw_deg_, serial_anchor_valid_);
-            const bool anchor_updated = serial_anchor_updated_;
-            serial_anchor_updated_ = false;
-
-            const double xy_rot_rad = xy_rotation_deg_ * M_PI / 180.0;
-            const double lidar_ang_rad = lidar2robot_ang_ * M_PI / 180.0;
-
-            double x_pos = std::cos(xy_rot_rad) * x_imu2lidar_ - std::sin(xy_rot_rad) * y_imu2lidar_;
-            double y_pos = std::sin(xy_rot_rad) * x_imu2lidar_ + std::cos(xy_rot_rad) * y_imu2lidar_;
-            double z_pos = z_imu2lidar_;
-
-            if (is_first_) {
-                first_x_ = x_pos;
-                first_y_ = y_pos;
-                first_z_ = z_pos;
-            }
-            x_pos -= first_x_;
-            y_pos -= first_y_;
-            z_pos -= first_z_;
-
-            const double effective_yaw = yaw_out + xy_rot_rad;
-            x_lidar2robot_ = x_pos - lidar2robot_dis_ * std::cos(lidar_ang_rad + effective_yaw);
-            y_lidar2robot_ = y_pos - lidar2robot_dis_ * std::sin(lidar_ang_rad + effective_yaw);
-            z_lidar2robot_ = z_pos + LIDAR2ROBOT_Z;
-
-            if (is_first_) {
-                output_first_x_ = x_lidar2robot_;
-                output_first_y_ = y_lidar2robot_;
-                output_first_z_ = z_lidar2robot_;
-                RCLCPP_INFO(get_logger(), "Output origin captured: x=%.4f y=%.4f z=%.4f",
-                            output_first_x_, output_first_y_, output_first_z_);
-            }
-            x_lidar2robot_ -= output_first_x_;
-            y_lidar2robot_ -= output_first_y_;
-            z_lidar2robot_ -= output_first_z_;
-
-            if (!is_first_ && !anchor_updated) {
-                const double dx = x_lidar2robot_ - last_x_;
-                const double dy = y_lidar2robot_ - last_y_;
-                const double dz = z_lidar2robot_ - last_z_;
+            if (!is_first_) {
+                const double dx = send_x - last_x_;
+                const double dy = send_y - last_y_;
+                const double dz = send_z - last_z_;
                 const double ddist = std::sqrt(dx * dx + dy * dy + dz * dz);
                 if (ddist > delta_dis_threshold_) {
                     RCLCPP_WARN(get_logger(),
@@ -474,35 +382,30 @@ private:
             last_angle_deg_ = send_yaw_deg;
             is_first_ = false;
 
-            if (!anchor_updated) {
-                const double delta_deg = send_yaw_deg - euler_last_deg_;
-                if (delta_deg > 180.0) {
-                    --k_;
-                } else if (delta_deg < -180.0) {
-                    ++k_;
-                }
-            }
-            euler_total_ = send_yaw_deg + 360.0 * k_;
-            euler_last_deg_ = send_yaw_deg;
-
             if (ser_.isOpen()) {
-                // 只有串口真正在线时，才持续输出和下发当前姿态/位置
-                RCLCPP_INFO(get_logger(), "x=%.3f y=%.3f z=%.3f yaw=%.3f pitch=%.3f roll=%.3f",
-                            send_y, -send_x, send_z,
-                            send_yaw_deg, send_pitch_deg, current_roll_deg);
+                if (high_freq_info_enabled_) {
+                    RCLCPP_INFO(get_logger(),
+                                "x=%.3f y=%.3f z=%9.3f yaw=%.3f pitch=%.3f roll=%.3f",
+                                send_x, send_y, send_z,
+                                send_yaw_deg, send_pitch_deg, current_roll_deg);
+                } else {
+                    // 默认降频，避免长期运行时被日志刷盘拖慢。
+                    RCLCPP_INFO_THROTTLE(
+                        get_logger(), *get_clock(), 1000,
+                        "x=%.3f y=%.3f z=%.3f yaw=%.3f pitch=%.3f roll=%.3f",
+                        send_x, send_y, send_z,
+                        send_yaw_deg, send_pitch_deg, current_roll_deg);
+                }
 
                 std::vector<uint8_t> frame;
                 frame.reserve(kFrameSize);
-                frame.push_back(kFrameHeader0);
-                frame.push_back(kFrameHeader1);
-                frame.push_back(kFrameHeader2);
-                appendFloat(frame, static_cast<float>(send_y));
-                appendFloat(frame, static_cast<float>(-send_x));
-                appendFloat(frame, static_cast<float>(send_z));
+                frame.insert(frame.end(), tx_header_.begin(), tx_header_.end());
+                appendFloat(frame, static_cast<float>(send_x * tx_position_scale_));
+                appendFloat(frame, static_cast<float>(send_y * tx_position_scale_));
+                appendFloat(frame, static_cast<float>(send_z * tx_position_scale_));
                 appendFloat(frame, static_cast<float>(send_yaw_deg));
                 appendFloat(frame, static_cast<float>(send_pitch_deg));
-                frame.push_back(kFrameTail0);
-                frame.push_back(kFrameTail1);
+                frame.insert(frame.end(), tx_tail_.begin(), tx_tail_.end());
 
                 try {
                     ser_.write(frame);
@@ -531,83 +434,29 @@ private:
 
     std::string serial_port_;
     int baudrate_ = 115200;
+    int serial_timeout_ms_ = 1000;
+    int serial_retry_interval_ms_ = 1000;
     std::string world_frame_;
     std::string body_frame_;
 
-    double fix_roll_deg_ = 21.30;
-    double fix_pitch_deg_ = 0.0;
-    double fix_yaw_deg_ = 0.0;
-    double xy_rotation_deg_ = 90.0;
-    double lidar2robot_dis_ = 0.31076;
-    double lidar2robot_ang_ = 0.0;
     double delta_dis_threshold_ = 0.2;
     double delta_angle_threshold_ = 0.2;
     double publish_rate_hz_ = 200.0;
-    double base_offset_x_ = 0.0;
-    double base_offset_y_ = 0.0;
-    double base_offset_z_ = 0.0;
-    double base_offset_yaw_deg_ = -90.0;
-    double base_offset_pitch_deg_ = 0.0;
+    bool high_freq_info_enabled_ = false;
+    double tx_position_scale_ = 1000.0;
+    std::array<uint8_t, 3> tx_header_ = kDefaultFrameHeader;
+    std::array<uint8_t, 2> tx_tail_ = kDefaultFrameTail;
+    std::array<uint8_t, 7> restart_magic_ = kDefaultRestartMagic;
     bool serial_open_ = false;
     std::chrono::steady_clock::time_point last_serial_attempt_{};
-    std::chrono::steady_clock::duration serial_retry_interval_{std::chrono::seconds(1)};
-
-    bool serial_anchor_valid_ = false;
-    bool serial_anchor_updated_ = false;
-    double serial_anchor_x_ = 0.0;
-    double serial_anchor_y_ = 0.0;
-    double serial_anchor_z_ = 0.0;
-    double serial_anchor_yaw_deg_ = 0.0;
-    double serial_anchor_pitch_deg_ = 0.0;
-    double serial_target_x_ = 0.0;
-    double serial_target_y_ = 0.0;
-    double serial_target_z_ = 0.0;
-    double serial_target_yaw_deg_ = 0.0;
-    double serial_target_pitch_deg_ = 0.0;
-
-    tf2::Quaternion q_fix_;
-
-    int count_ = 0;
-    bool averaged_ = false;
-    double sum_x_ = 0.0;
-    double sum_y_ = 0.0;
-    double sum_z_ = 0.0;
-    double sum_sin_roll_leveled_ = 0.0;
-    double sum_cos_roll_leveled_ = 0.0;
-    double sum_sin_pitch_leveled_ = 0.0;
-    double sum_cos_pitch_leveled_ = 0.0;
-    double sum_sin_yaw_leveled_ = 0.0;
-    double sum_cos_yaw_leveled_ = 0.0;
-
-    double avg_x_ = 0.0;
-    double avg_y_ = 0.0;
-    double avg_z_ = 0.0;
-    double avg_roll_leveled_ = 0.0;
-    double avg_pitch_leveled_ = 0.0;
-    double avg_yaw_leveled_ = 0.0;
+    std::string restart_command_;
+    bool restart_requested_ = false;
 
     bool is_first_ = true;
-    double first_x_ = 0.0;
-    double first_y_ = 0.0;
-    double first_z_ = 0.0;
-    double output_first_x_ = 0.0;
-    double output_first_y_ = 0.0;
-    double output_first_z_ = 0.0;
-
     double last_x_ = 0.0;
     double last_y_ = 0.0;
     double last_z_ = 0.0;
     double last_angle_deg_ = 0.0;
-    double euler_last_deg_ = 0.0;
-    double euler_total_ = 0.0;
-    int k_ = 0;
-
-    double x_imu2lidar_ = 0.0;
-    double y_imu2lidar_ = 0.0;
-    double z_imu2lidar_ = 0.0;
-    double x_lidar2robot_ = 0.0;
-    double y_lidar2robot_ = 0.0;
-    double z_lidar2robot_ = 0.0;
 
     std::vector<uint8_t> rx_buffer_;
 };
