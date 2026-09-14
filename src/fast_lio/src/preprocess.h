@@ -158,7 +158,7 @@ class Preprocess
   Eigen::Matrix3d R_lidar_to_robot = Eigen::Matrix3d::Identity();
   Eigen::Vector3d t_lidar_to_robot = Eigen::Vector3d::Zero();
 
-  // 自车几何滤波：由 laserMapping 从 /robot_description 建好后挂进来。
+  // 自车几何滤波：由 laserMapping 按 YAML 的 self_filter/box_min/box_max 建好后挂进来。
   // 为空或还没 ready() 时该滤波不生效。
   std::shared_ptr<const fast_lio::RobotSelfFilter> self_filter = nullptr;
 

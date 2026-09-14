@@ -36,7 +36,7 @@ T_base^odom
 公开 TF 链路为：
 
 ```text
-odom -> base_link -> lidar_link -> imu_link
+odom -> base_link -> livox_frame -> imu_link
    \-> base_link_hf
 ```
 
@@ -44,10 +44,12 @@ odom -> base_link -> lidar_link -> imu_link
 | --- | --- |
 | `odom -> base_link` | LiDAR 帧率更新的机器人中心里程计 |
 | `odom -> base_link_hf` | IMU 高频传播得到的机器人中心里程计，供串口反馈使用 |
-| `base_link -> lidar_link` | YAML 中的雷达安装外参 `T_lidar^base` |
-| `lidar_link -> imu_link` | MID-360 官方内部外参 `T_imu^lidar` |
+| `base_link -> livox_frame` | YAML 中的雷达安装外参 `T_lidar^base`；`livox_frame` 与 Livox 驱动消息的 `frame_id` 一致 |
+| `livox_frame -> imu_link` | MID-360 官方内部外参 `T_imu^lidar` |
 
-`odometry/zero_at_start: true` 时，第一帧有效机器人中心位姿被设为 `odom` 原点，起始 XYZ/RPY 为零。`mapping/extrinsic_est_en` 保留 FAST-LIO 的在线外参估计代码，但 MID-360 默认设置为 `false`，此时 EKF、机器人中心里程计和静态 TF 使用同一组 YAML 外参。若改为 `true`，EKF 内部的 `T_lidar^imu` 可能变化，而公开的 `lidar_link -> imu_link` 仍是 YAML 静态值，调试 TF 时需要注意二者不再严格等价。
+整条链路由 `fastlio_mapping` 自己发布，不依赖 `robot_state_publisher` / URDF：这样原始点云 `/livox/lidar`、地面分割和 Nav2 拿到的 `livox_frame` 与定位输出在同一棵 TF 树上。
+
+`odometry/zero_at_start: true` 时，第一帧有效机器人中心位姿被设为 `odom` 原点，起始 XYZ/RPY 为零。`mapping/extrinsic_est_en` 保留 FAST-LIO 的在线外参估计代码，但 MID-360 默认设置为 `false`，此时 EKF、机器人中心里程计和静态 TF 使用同一组 YAML 外参。若改为 `true`，EKF 内部的 `T_lidar^imu` 可能变化，而公开的 `livox_frame -> imu_link` 仍是 YAML 静态值，调试 TF 时需要注意二者不再严格等价。
 
 ## 构建与启动
 

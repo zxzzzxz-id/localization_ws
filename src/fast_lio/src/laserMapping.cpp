@@ -57,7 +57,8 @@ string odom_frame = "odom";
 string robot_frame = "base_link";
 string robot_hf_frame = "base_link_hf";
 string imu_frame = "imu_link";
-string lidar_frame = "lidar_link";
+// 默认与 Livox 驱动消息的 frame_id 一致；实际取值由 YAML 的 frames/lidar 覆盖。
+string lidar_frame = "livox_frame";
 double odom_log_interval_sec = 1.0;
 
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -1323,7 +1324,7 @@ int main(int argc, char** argv)
     rosparam_get("frames/robot", robot_frame, std::string("base_link"));
     rosparam_get("frames/robot_hf", robot_hf_frame, std::string("base_link_hf"));
     rosparam_get("frames/imu", imu_frame, std::string("imu_link"));
-    rosparam_get("frames/lidar", lidar_frame, std::string("lidar_link"));
+    rosparam_get("frames/lidar", lidar_frame, std::string("livox_frame"));
     rosparam_get("odometry/zero_at_start", zero_odom_at_start, true);
     rosparam_get("diagnostics/odom_log_interval_sec", odom_log_interval_sec, 1.0);
     rosparam_get("reloc/reloc_topic", reloc_topic, std::string("/reloc/cloud_align"));
@@ -1398,7 +1399,8 @@ int main(int argc, char** argv)
     if (extrinsic_est_en) {
         ROS_PRINT_WARN(
             "mapping/extrinsic_est_en=true: EKF T_lidar^imu may change while the public "
-            "lidar_link -> imu_link static TF remains the configured YAML value.");
+            "%s -> %s static TF remains the configured YAML value.",
+            lidar_frame.c_str(), imu_frame.c_str());
     }
     path.header.stamp = get_ros_now();
     path.header.frame_id = odom_frame;
