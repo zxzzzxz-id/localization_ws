@@ -18,12 +18,15 @@ runtime_pos_log_enable: false
 
 # Semantic TF names published by fastlio_mapping.
 # Public odometry is expressed at the robot center; IMU and LiDAR are static child frames.
+# `lidar` 必须与 Livox 驱动消息的 frame_id 一致（launch_ROS2/msg_MID360_launch.py 里是
+# livox_frame）：这样 base_link -> livox_frame 由本节点按 robot_extrinsic 发布，
+# 原始点云 /livox/lidar、地面分割与 Nav2 都不再需要 robot_state_publisher / URDF。
 frames:
     odom: "odom"
     robot: "base_link"
     robot_hf: "base_link_hf"
     imu: "imu_link"
-    lidar: "lidar_link"
+    lidar: "livox_frame"
 
 odometry:
     zero_at_start: true          # make the first robot-center pose identity in odom
@@ -70,6 +73,9 @@ sensor_extrinsic:
 # T_lidar^base: LiDAR pose relative to the robot-center frame.
 # p^base = R_lidar^base * p^lidar + t_lidar^base.
 # R is row-major and t is the LiDAR origin expressed in base coordinates.
+# 这组值是 base_link -> livox_frame 静态 TF 的唯一来源。RViz 的 RobotModel 读的是
+# robot_description/config/measurement_params_real.yaml 导出的 URDF（仅可视化），
+# 两者数值应保持一致，模型才不会偏。
 robot_extrinsic:
   lidar_to_robot_R: [ 0.0, 1.0, 0.0,
                      -1.0, 0.0, 0.0,

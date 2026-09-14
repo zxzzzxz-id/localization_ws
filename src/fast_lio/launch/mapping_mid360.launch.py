@@ -33,18 +33,10 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument("use_rviz", default_value="true"),
-        # 自车几何滤波（self_filter）靠 /robot_description 拿机器人几何，
-        # 所以默认把 robot_state_publisher 一起拉起来，避免漏启动导致滤波静默失效。
-        # 如果链路脚本里已经单独开了 01_robot_state_publisher，就把这个设成 false。
-        DeclareLaunchArgument(
-            "start_robot_state_publisher", default_value="true",
-            description="是否同时启动 robot_state_publisher（self_filter 需要 /robot_description）"),
-        Node(
-            package="robot_description",
-            executable="start_robot_state_publisher.py",
-            output="screen",
-            condition=IfCondition(LaunchConfiguration("start_robot_state_publisher")),
-        ),
+        # TF 全部由 fastlio_mapping 按 YAML 外参发布：
+        #   odom -> base_link / base_link_hf，base_link -> livox_frame -> imu_link
+        # frames.lidar=livox_frame 与 Livox 驱动消息的 frame_id 一致，所以这里不再需要
+        # robot_state_publisher / URDF（self_filter 走 YAML 的 box_min/box_max，也不需要）。
         Node(
             package="fast_lio",
             executable="fastlio_mapping",

@@ -40,18 +40,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument("use_rviz", default_value="true"),
-        # 自车几何滤波（self_filter）靠 /robot_description 拿机器人几何，
-        # 所以默认把 robot_state_publisher 一起拉起来，避免漏启动导致滤波静默失效。
-        # 如果链路脚本里已经单独开了 01_robot_state_publisher，就把这个设成 false。
-        DeclareLaunchArgument(
-            "start_robot_state_publisher", default_value="true",
-            description="是否同时启动 robot_state_publisher（self_filter 需要 /robot_description）"),
-        Node(
-            package="robot_description",
-            executable="start_robot_state_publisher.py",
-            output="screen",
-            condition=IfCondition(LaunchConfiguration("start_robot_state_publisher")),
-        ),
+        # 同 mapping：base_link -> livox_frame -> imu_link 由 fastlio_mapping 按 YAML
+        # 外参发布；icp_relocalizer 收到 /cloud_registered_body（imu_link 系）后靠这条
+        # TF 变换到 base_link，因此不再需要 robot_state_publisher / URDF。
         DeclareLaunchArgument(
             "map_pcd",
             default_value=str(package_dir / "PCD" / "scans.pcd"),
