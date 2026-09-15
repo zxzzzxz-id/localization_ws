@@ -1,8 +1,16 @@
 common:
+    # IMU source switch used by mapping_mid360.launch.py and reloc_mid360.launch.py.
+    # livox: use the MID-360 built-in IMU below.
+    # external: keep this file's other settings, then overlay config/imu/external_1000hz.yaml.
+    imu_source: "livox"
     lid_topic: "/livox/lidar"
     imu_topic: "/livox/imu"
+    imu_nominal_rate_hz: 200.0
     time_sync_en: false          # Only enable when reliable hardware time synchronization is unavailable.
-    time_offset_lidar_to_imu: 0.0  # LiDAR time minus IMU time, in seconds. Keep 0.0 when unknown.
+    # FAST-LIO applies: corrected_imu_stamp = input_imu_stamp - this value.
+    # Keep 0.0 when LiDAR and IMU header.stamp already share the same hardware clock.
+    time_offset_lidar_to_imu: 0.0
+    imu_time_sync_verified: true
 
 # FAST-LIO runtime/filter parameters.
 feature_extract_enable: false
@@ -65,6 +73,7 @@ mapping:
 # x=11.0 mm, y=23.29 mm, z=-44.12 mm in the point-cloud coordinates.
 # FAST-LIO internally initializes T_lidar^imu = inverse(T_imu^lidar).
 sensor_extrinsic:
+    calibrated: true
     imu_in_lidar_R:   [1.0, 0.0, 0.0,
                        0.0, 1.0, 0.0,
                        0.0, 0.0, 1.0]
@@ -87,6 +96,8 @@ publish:
     scan_publish_en: true        # publish /cloud_registered
     dense_publish_en: false       # dense world-frame cloud; consumes more CPU and bandwidth
     scan_bodyframe_pub_en: true   # publish /cloud_registered_body for local voxel costmap
+    high_freq_odom_rate_hz: 200.0
+    high_freq_fill_timeout_sec: 0.2
     feature_pub_en: false
     effect_pub_en: false
 
@@ -97,6 +108,7 @@ pcd_save:
 
 diagnostics:
     odom_log_interval_sec: 1.0   # log odom -> base_link xyz[m] and rpy[deg]; 0 disables logging
+    lidar_imu_time_diff_log_interval_sec: 2.0  # log corrected LiDAR/IMU stamp delta; 0 disables
 
 reloc:
     reloc_en: false

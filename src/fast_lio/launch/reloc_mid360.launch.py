@@ -29,14 +29,19 @@ def flatten_yaml(path: Path) -> dict:
 
 def generate_launch_description():
     package_dir = Path(get_package_share_directory("fast_lio"))
-    params = flatten_yaml(package_dir / "config" / "mapping" / "mid360.yaml")
-    params.update(flatten_yaml(package_dir / "config" / "reloc" / "mid360.yaml"))
     relocalization_params = str(
         package_dir / "config" / "reloc" / "relocalization.yaml")
 
     map_pcd = LaunchConfiguration("map_pcd")
     start_map = LaunchConfiguration("start_map")
     start_relocalizer = LaunchConfiguration("start_relocalizer")
+    params = flatten_yaml(package_dir / "config" / "mapping" / "mid360.yaml")
+    imu_source = params.get("common/imu_source", "livox")
+    if imu_source == "external":
+        params.update(flatten_yaml(package_dir / "config" / "imu" / "external_1000hz.yaml"))
+    elif imu_source != "livox":
+        raise RuntimeError(f"Unsupported common/imu_source in mid360.yaml: {imu_source}")
+    params.update(flatten_yaml(package_dir / "config" / "reloc" / "mid360.yaml"))
 
     return LaunchDescription([
         DeclareLaunchArgument("use_rviz", default_value="true"),
