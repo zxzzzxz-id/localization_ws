@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
+#include <cmath>
 #include <math.h>
 #include <thread>
 #include <fstream>
@@ -52,6 +53,7 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string lid_topic, imu_topic;
+string imu_source = "livox";
 string reloc_topic;
 string odom_frame = "odom";
 string robot_frame = "base_link";
@@ -60,6 +62,7 @@ string imu_frame = "imu_link";
 // 默认与 Livox 驱动消息的 frame_id 一致；实际取值由 YAML 的 frames/lidar 覆盖。
 string lidar_frame = "livox_frame";
 double odom_log_interval_sec = 1.0;
+double lidar_imu_time_diag_interval_sec = 2.0;
 
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
@@ -72,6 +75,12 @@ bool   lidar_pushed, flg_first_scan = true, flg_EKF_inited;
 std::atomic<bool> flg_exit(false);
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool reloc_en = false;
+bool imu_extrinsic_calibrated = true;
+bool imu_time_sync_verified = true;
+double imu_nominal_rate_hz = 200.0;
+double high_freq_odom_rate_hz = 200.0;
+double high_freq_fill_timeout_sec = 0.2;
+std::size_t hf_imu_buffer_capacity = 256;
 // 自车几何滤波：只使用 YAML 内置 box。
 bool self_filter_en = false;
 std::vector<double> self_filter_box_min{-0.4, -0.4, -0.05};
@@ -149,7 +158,7 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 // scan end (and at rebase / relocalization); the publish thread then
 // re-predicts forward from that base using every IMU sample that arrives
 // afterwards, with the same kinematics as the EKF process model. This makes
-// /OdometryHighFreq advance at the true IMU rate (uniform 200 Hz output)
+// /OdometryHighFreq advance with a configurable publish cadence.
 // instead of only updating once per LiDAR scan.
 // ------------------------------------------------------------------
 struct ImuRawSample
@@ -508,6 +517,27 @@ inline void warn_if_self_filter_pending()
         p_pre->blind);
 }
 
+void log_lidar_imu_time_delta_locked(const char *event)
+{
+    if (lidar_imu_time_diag_interval_sec <= 0.0 ||
+        last_timestamp_lidar <= 0.0 || last_timestamp_imu <= 0.0) {
+        return;
+    }
+    static auto last_log_time = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last_log_time.time_since_epoch().count() != 0 &&
+        now - last_log_time < std::chrono::duration<double>(lidar_imu_time_diag_interval_sec)) {
+        return;
+    }
+    last_log_time = now;
+    const double lidar_minus_imu = last_timestamp_lidar - last_timestamp_imu;
+    ROS_PRINT_INFO(
+        "LiDAR/IMU stamp delta after correction [%s]: lidar %.9f - imu %.9f = %.6f s; "
+        "FAST-LIO applies corrected_imu_stamp=input_imu_stamp-%.9f.",
+        event, last_timestamp_lidar, last_timestamp_imu, lidar_minus_imu,
+        time_diff_lidar_to_imu);
+}
+
 void standard_pcl_cbk(const Pcl2MsgConstPtr &msg) 
 {
     mtx_buffer.lock();
@@ -526,6 +556,7 @@ void standard_pcl_cbk(const Pcl2MsgConstPtr &msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(stamp_sec);
     last_timestamp_lidar = stamp_sec;
+    log_lidar_imu_time_delta_locked("lidar");
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -546,6 +577,7 @@ void livox_pcl_cbk(const LivoxCustomMsgConstPtr &msg)
         lidar_buffer.clear();
     }
     last_timestamp_lidar = stamp_sec;
+    log_lidar_imu_time_delta_locked("lidar");
     
     if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
     {
@@ -593,6 +625,7 @@ void imu_cbk(const ImuMsgConstPtr &msg_in)
     }
 
     last_timestamp_imu = timestamp;
+    log_lidar_imu_time_delta_locked("imu");
 
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
@@ -615,7 +648,7 @@ void imu_cbk(const ImuMsgConstPtr &msg_in)
                        msg->linear_acceleration.y,
                        msg->linear_acceleration.z;
         hf_base.imu_samples.push_back(sample);
-        while (hf_base.imu_samples.size() > 256) {
+        while (hf_base.imu_samples.size() > hf_imu_buffer_capacity) {
             hf_base.imu_samples.pop_front();
         }
     }
@@ -884,9 +917,11 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
 {
     static auto br_hf = std::make_shared<tf2_ros::TransformBroadcaster>(get_ros_node());
 
-    // Fixed 200 Hz cadence: one pose per tick, re-predicted through every
+    // Configurable cadence: one pose per tick, re-predicted through every
     // IMU sample that arrived since the last scan-end correction.
-    const std::chrono::milliseconds period(5);
+    const double publish_period_sec = 1.0 / high_freq_odom_rate_hz;
+    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(publish_period_sec));
     auto next_tick = std::chrono::steady_clock::now();
 
     // Local integrator state, re-seeded from hf_base whenever the corrected
@@ -903,9 +938,10 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
     // pose, plus a self-adapting estimate of the IMU sample period.
     bool   have_last_imu = false;
     V3D    last_gyro = Zero3d, last_acc = Zero3d;
-    double period_ema = 0.005;        // typical IMU sample period [s]
+    const double nominal_imu_period_sec = 1.0 / imu_nominal_rate_hz;
+    double period_ema = nominal_imu_period_sec;        // typical IMU sample period [s]
     double prev_sample_ts = -1.0;
-    int    ticks_since_integration = 0;
+    double time_since_integration = 0.0;
     bool   integrated_this_tick = false;
     double last_published_ts = -1.0;
 
@@ -914,7 +950,7 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         next_tick += period;
         std::this_thread::sleep_until(next_tick);
         integrated_this_tick = false;
-        ticks_since_integration++;
+        time_since_integration += publish_period_sec;
 
         std::vector<ImuRawSample> samples;
         {
@@ -963,10 +999,11 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
             last_acc  = s.acc;
             have_last_imu = true;
             integrated_this_tick = true;
-            ticks_since_integration = 0;
+            time_since_integration = 0.0;
             if (prev_sample_ts > 0.0) {
                 const double pdt = s.timestamp - prev_sample_ts;
-                if (pdt > 0.002 && pdt < 0.02) {
+                if (pdt > std::max(0.0001, nominal_imu_period_sec * 0.25) &&
+                    pdt < std::min(0.1, nominal_imu_period_sec * 4.0)) {
                     period_ema = 0.9 * period_ema + 0.1 * pdt;
                 }
             }
@@ -981,10 +1018,9 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         // integrated for a while (IMU outage), the fill stops and the pose
         // holds instead of drifting.
         if (!integrated_this_tick && have_last_imu &&
-            ticks_since_integration <= 40)
+            time_since_integration <= high_freq_fill_timeout_sec)
         {
-            double dt_fill = 0.8 * period_ema;
-            if (dt_fill > 0.0045) dt_fill = 0.0045;
+            double dt_fill = std::min(0.8 * period_ema, 0.9 * nominal_imu_period_sec);
             const V3D acc_norm = last_acc * acc_scale;
             const V3D acc_w   = rot * (acc_norm - ba);
             const V3D gyro_c  = last_gyro - bg;
@@ -1318,8 +1354,11 @@ int main(int argc, char** argv)
     rosparam_get("publish/effect_pub_en", effect_pub_en, false);
     rosparam_get("reloc/reloc_en", reloc_en, false);
     rosparam_get("max_iteration", NUM_MAX_ITERATIONS, 4);
+    rosparam_get("common/imu_source", imu_source, std::string("livox"));
     rosparam_get("common/lid_topic", lid_topic, std::string("/livox/lidar"));
     rosparam_get("common/imu_topic", imu_topic, std::string("/livox/imu"));
+    rosparam_get("common/imu_nominal_rate_hz", imu_nominal_rate_hz, 200.0);
+    rosparam_get("common/imu_time_sync_verified", imu_time_sync_verified, true);
     rosparam_get("frames/odom", odom_frame, std::string("odom"));
     rosparam_get("frames/robot", robot_frame, std::string("base_link"));
     rosparam_get("frames/robot_hf", robot_hf_frame, std::string("base_link_hf"));
@@ -1327,9 +1366,12 @@ int main(int argc, char** argv)
     rosparam_get("frames/lidar", lidar_frame, std::string("livox_frame"));
     rosparam_get("odometry/zero_at_start", zero_odom_at_start, true);
     rosparam_get("diagnostics/odom_log_interval_sec", odom_log_interval_sec, 1.0);
+    rosparam_get("diagnostics/lidar_imu_time_diff_log_interval_sec", lidar_imu_time_diag_interval_sec, 2.0);
     rosparam_get("reloc/reloc_topic", reloc_topic, std::string("/reloc/cloud_align"));
     rosparam_get("common/time_sync_en", time_sync_en, false);
     rosparam_get("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
+    rosparam_get("publish/high_freq_odom_rate_hz", high_freq_odom_rate_hz, 200.0);
+    rosparam_get("publish/high_freq_fill_timeout_sec", high_freq_fill_timeout_sec, 0.2);
     rosparam_get("filter_size_corner", filter_size_corner_min, 0.5);
     rosparam_get("filter_size_surf", filter_size_surf_min, 0.5);
     rosparam_get("filter_size_map", filter_size_map_min, 0.5);
@@ -1356,6 +1398,7 @@ int main(int argc, char** argv)
     rosparam_get("pcd_save/pcd_save_en", pcd_save_en, false);
     rosparam_get("pcd_save/interval", pcd_save_interval, -1);
     rosparam_get("mapping/extrinsic_est_en", extrinsic_est_en, false);
+    rosparam_get("sensor_extrinsic/calibrated", imu_extrinsic_calibrated, true);
     rosparam_get("sensor_extrinsic/imu_in_lidar_T", param_t_imu_in_lidar,
                  std::vector<double>{0.011, 0.02329, -0.04412});
     rosparam_get("sensor_extrinsic/imu_in_lidar_R", param_R_imu_in_lidar,
@@ -1364,6 +1407,35 @@ int main(int argc, char** argv)
     rosparam_get("robot_extrinsic/lidar_to_robot_R", param_R_lidar_in_robot,
                  std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0});
 
+    if (imu_source != "livox" && imu_source != "external") {
+        ROS_PRINT_ERROR("common/imu_source must be either 'livox' or 'external', got '%s'.", imu_source.c_str());
+        return 1;
+    }
+    if (!std::isfinite(imu_nominal_rate_hz) || imu_nominal_rate_hz <= 0.0) {
+        ROS_PRINT_WARN("common/imu_nominal_rate_hz must be > 0; forcing 200 Hz.");
+        imu_nominal_rate_hz = 200.0;
+    }
+    if (!std::isfinite(high_freq_odom_rate_hz) || high_freq_odom_rate_hz <= 0.0) {
+        ROS_PRINT_WARN("publish/high_freq_odom_rate_hz must be > 0; using common/imu_nominal_rate_hz.");
+        high_freq_odom_rate_hz = imu_nominal_rate_hz;
+    }
+    if (!std::isfinite(high_freq_fill_timeout_sec) || high_freq_fill_timeout_sec < 0.0) {
+        ROS_PRINT_WARN("publish/high_freq_fill_timeout_sec must be >= 0; forcing 0.2 s.");
+        high_freq_fill_timeout_sec = 0.2;
+    }
+    if (!std::isfinite(lidar_imu_time_diag_interval_sec) || lidar_imu_time_diag_interval_sec < 0.0) {
+        ROS_PRINT_WARN("diagnostics/lidar_imu_time_diff_log_interval_sec must be >= 0; disabling stamp delta logs.");
+        lidar_imu_time_diag_interval_sec = 0.0;
+    }
+    hf_imu_buffer_capacity = std::max<std::size_t>(
+        256, static_cast<std::size_t>(std::ceil(imu_nominal_rate_hz * 0.5)));
+    if (imu_source == "external" && (!imu_extrinsic_calibrated || !imu_time_sync_verified)) {
+        ROS_PRINT_ERROR(
+            "external IMU mode is blocked: set sensor_extrinsic/calibrated=true only after real T_imu^lidar calibration, "
+            "and set common/imu_time_sync_verified=true only after confirming LiDAR and IMU header.stamp share one clock. "
+            "Edit config/imu/external_1000hz.yaml before running mapping or relocation.");
+        return 1;
+    }
     if (odom_log_interval_sec < 0.0) {
         ROS_PRINT_WARN("diagnostics/odom_log_interval_sec must be >= 0; disabling odometry logs.");
         odom_log_interval_sec = 0.0;
@@ -1396,6 +1468,30 @@ int main(int argc, char** argv)
             "proper row-major 3x3 rotation matrices.");
         return 1;
     }
+    if (imu_source == "external") {
+        bool placeholder_rotation = true;
+        bool placeholder_translation = true;
+        for (std::size_t i = 0; i < param_R_imu_in_lidar.size(); ++i) {
+            const double expected = (i == 0 || i == 4 || i == 8) ? 1.0 : 0.0;
+            placeholder_rotation = placeholder_rotation &&
+                std::abs(param_R_imu_in_lidar[i] - expected) < 1e-9;
+        }
+        for (const double value : param_t_imu_in_lidar) {
+            placeholder_translation = placeholder_translation && std::abs(value) < 1e-9;
+        }
+        if (placeholder_rotation && placeholder_translation) {
+            ROS_PRINT_ERROR(
+                "external IMU mode is blocked: sensor_extrinsic/imu_in_lidar_R is identity and "
+                "sensor_extrinsic/imu_in_lidar_T is zero. Replace the placeholder T_imu^lidar in "
+                "config/imu/external_1000hz.yaml with the calibrated external IMU extrinsic.");
+            return 1;
+        }
+    }
+    ROS_PRINT_INFO(
+        "IMU input: source=%s topic=%s frame=%s nominal_rate=%.1f Hz high_freq_odom=%.1f Hz "
+        "time_offset_lidar_to_imu=%.9f s (corrected_imu_stamp=input_imu_stamp-offset) buffer=%zu samples.",
+        imu_source.c_str(), imu_topic.c_str(), imu_frame.c_str(), imu_nominal_rate_hz,
+        high_freq_odom_rate_hz, time_diff_lidar_to_imu, hf_imu_buffer_capacity);
     if (extrinsic_est_en) {
         ROS_PRINT_WARN(
             "mapping/extrinsic_est_en=true: EKF T_lidar^imu may change while the public "

@@ -1,0 +1,36 @@
+common:
+    imu_source: "external"
+    imu_topic: "/external_imu/data_raw"
+    imu_nominal_rate_hz: 1000.0
+    time_sync_en: false
+    # FAST-LIO applies: corrected_imu_stamp = input_imu_stamp - this value.
+    # Set this only after confirming the LiDAR and external IMU header.stamp domains.
+    time_offset_lidar_to_imu: 0.0
+    imu_time_sync_verified: false
+
+frames:
+    imu: "external_imu_link"
+
+mapping:
+    # Placeholder values for the external IMU. Replace them with values from the
+    # external sensor datasheet or calibration report before enabling external mode.
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    extrinsic_est_en: false
+
+# Convention: T_B^A maps p^B to p^A.
+# T_imu^lidar maps external IMU-frame points into the LiDAR frame:
+# p^lidar = R_imu^lidar * p^imu + t_imu^lidar.
+# R is row-major; T is meters. Identity/zero is only an uncalibrated placeholder.
+sensor_extrinsic:
+    calibrated: false
+    imu_in_lidar_R:   [1.0, 0.0, 0.0,
+                       0.0, 1.0, 0.0,
+                       0.0, 0.0, 1.0]
+    imu_in_lidar_T: [0.0, 0.0, 0.0]
+
+publish:
+    high_freq_odom_rate_hz: 1000.0
+    high_freq_fill_timeout_sec: 0.2
