@@ -99,6 +99,7 @@ ament_target_dependencies(icp_relocalizer
   tf2
   tf2_ros
   pcl_conversions
+  std_msgs
 )
 target_link_libraries(icp_relocalizer
   ${PCL_LIBRARIES}

@@ -19,28 +19,49 @@ pcd_to_occupancy_map:
 
 icp_relocalizer:
   ros__parameters:
-    # 先验地图降采样体素（米），作为 ICP 目标点云
+    # 兼容旧参数；新流程实际使用下面的 coarse/fine 两套 voxel。
     map_voxel: 0.2
-    # 实时点云降采样体素（米）
     source_voxel: 0.2
+    # 粗配准：大 voxel + 大匹配距离，目标是进入正确局部最优附近。
+    coarse_map_voxel: 0.3
+    coarse_source_voxel: 0.3
+    coarse_max_correspondence_distance: 1.5
+    coarse_max_iterations: 50
+    coarse_fitness_threshold: 0.7
+    # 精配准：小 voxel + GICP，提高最终 x/y/yaw 精度。
+    fine_map_voxel: 0.1
+    fine_source_voxel: 0.1
+    fine_max_correspondence_distance: 0.5
+    fine_max_iterations: 80
+    fine_fitness_threshold: 0.25
+    gicp_correspondence_randomness: 20
     # 只取这个高度带内的点参与匹配（单位米，相对 base_link）
     z_min: -0.5
     z_max: 1.5
     # 实时点云话题（fast_lio 去畸变后的 body 系点云）
     input_topic: "/cloud_registered_body"
+    # 外部重定位请求。收到 std_msgs/msg/Empty 后，清空累计并重新跑同一套流程。
+    request_topic: "/reloc/request"
     # 匹配前先把点云变换到这个坐标系，ICP 结果直接就是这个坐标系的位姿
     base_frame: "base_link"
     # 输出位姿的 frame_id（fast_lio reloc 要求是 odom 或空）
     odom_frame: "odom"
     # 输出话题：fast_lio 的重定位接口
     output_topic: "/reloc/cloud_align"
-    # ICP 最近邻最大距离（米）
+    # 兼容旧参数；新流程实际使用 coarse/fine distance。
     max_correspondence_distance: 1.0
     max_iterations: 50
-    # 均方根残差超过这个值认为匹配失败，不发布结果（米）
+    # 兼容旧参数；新流程实际使用 coarse/fine fitness threshold。
     fitness_threshold: 0.3
     # 实时点云少于这个点数不匹配
     min_source_points: 200
+    # 粗配准后，删除离先验地图太远的点（动态物体 / 地图变化 / 错误点）。
+    map_consistency_distance: 0.5
+    min_map_consistent_points: 200
+    # 最终 overlap 判断：避免 fitness 很小但只有少量点匹配成功的 false accept。
+    overlap_distance: 0.5
+    min_overlap_ratio: 0.35
+    min_correspondences: 300
     # 先攒这么多帧融合成本地子图再匹配一次（10Hz 下 30 帧 ≈ 3 秒）
     # 融合期间机器人要基本静止。设 1 = 用单帧（不推荐，容易滑）
     accumulate_frames: 30
@@ -50,6 +71,8 @@ icp_relocalizer:
     max_roll_pitch_deg: 10.0
     # 相对 ICP 初值的最大净平移，超过说明匹配滑走了（米）
     max_correction_dist: 2.0
+    # 相对初值的最大 yaw 修正量，超过认为超出当前粗配准捕获范围（度）
+    max_yaw_correction_deg: 35.0
     # 用当前 odom->base_link 作为 ICP 初值（先验图与起点接近时推荐）
     use_odom_as_initial_guess: true
     # 初值上再叠加的偏移（米 / 弧度）
@@ -59,7 +82,21 @@ icp_relocalizer:
     initial_yaw: 0.0
     # 匹配成功后只发布一次
     one_shot: true
+    # true: 启动后自动跑一次；false: 只响应 request_topic。
+    auto_relocalize_on_start: true
     # 两次匹配之间的最小间隔（秒）
     cooldown: 3.0
     # 重定位成功后发布静态 map->odom（重定位后 odom 已对齐到先验图）
     publish_static_map_to_odom: true
+    # 时间一致性过滤：启动静止时，保留跨多帧重复出现的 voxel。
+    time_consistency_filter_en: true
+    time_consistency_voxel: 0.15
+    time_consistency_min_ratio: 0.35
+    time_consistency_min_frames: 3
+    # RViz 调试点云：
+    # /reloc/debug/accumulated_raw
+    # /reloc/debug/time_filtered
+    # /reloc/debug/coarse_aligned
+    # /reloc/debug/map_consistent
+    # /reloc/debug/fine_aligned
+    debug_publish_clouds: true
