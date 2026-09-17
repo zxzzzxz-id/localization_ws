@@ -1,0 +1,58 @@
+# Local agent instructions
+AGENTS.md
+CLAUDE.md
+
+# Local regression suites and installation test helper
+tests/
+test/
+/python/tools/check_install.py
+
+# Build and IDE output
+build/
+output/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+*.egg-info/
+.vscode/
+.trae/
+
+# Keil MDK artifacts
+**/OBJ/
+**/DebugConfig/
+**/Listings/
+**/Objects/
+*.uvguix.*
+*.map
+*.lst
+*.crf
+*.d
+*.o
+*.axf
+*.htm
+*.dep
+*.bak
+*.scvd
+*.sct
+*.lnp
+*.iex
+*.__i
+JLinkLog.txt
+JLinkSettings.ini
+RTE/
+
+# ROS workspaces
+ros/ros1/build/
+ros/ros1/devel/
+ros/ros1/install/
+ros/ros1/src/CMakeLists.txt
+ros/ros2/build/
+ros/ros2/install/
+ros/ros2/log/
+
+# Python SDK runtime files
+/python/*.bin
+/python/*.jsonl
+/python/*.log

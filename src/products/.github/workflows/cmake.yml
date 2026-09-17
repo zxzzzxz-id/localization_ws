@@ -1,0 +1,131 @@
+name: c-sdk
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  c-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            cc: gcc
+            cxx: g++
+            flags: ""
+          - os: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+            flags: ""
+          - os: ubuntu-26.04
+            cc: gcc
+            cxx: g++
+            flags: ""
+          - os: ubuntu-24.04-arm
+            cc: gcc
+            cxx: g++
+            flags: ""
+          - os: ubuntu-24.04
+            cc: clang
+            cxx: clang++
+            flags: "-fsanitize=undefined,address,float-cast-overflow -g"
+          - os: windows-latest
+            flags: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure Linux
+        if: runner.os == 'Linux'
+        run: cmake -S c -B build/c-sdk -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_C_FLAGS="${{ matrix.flags }}" -DCMAKE_CXX_FLAGS="${{ matrix.flags }}"
+      - name: Configure Windows (MSVC)
+        if: runner.os == 'Windows'
+        run: cmake -S c -B build/c-sdk
+      - name: Build the customer C SDK entry point
+        run: cmake --build build/c-sdk --config Release
+
+  ros2:
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [humble, jazzy, lyrical]
+        os: [ubuntu-24.04]
+        include:
+          - distro: jazzy
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    container: ros:${{ matrix.distro }}-ros-base
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ws/src/products
+      - name: Prepare ROS dependency index
+        shell: bash
+        run: |
+          apt-get update
+          # GitHub sets HOME=/github/home; rosdep's image cache lives in /root.
+          rosdep update --rosdistro ${{ matrix.distro }}
+      - name: Build complete checkout in a workspace
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          cd ws
+          test "$(colcon list --names-only | sort)" = $'hipnuc_imu\nhipnuc_msgs'
+          rosdep install --from-paths $(colcon list --paths-only) --ignore-src -y
+          colcon build --event-handlers console_direct+ --cmake-args -DBUILD_TESTING=OFF
+      - name: Check installed nodes
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          source ws/install/setup.bash
+          test "$(ros2 pkg prefix hipnuc_imu)" = "$PWD/ws/install/hipnuc_imu"
+          test "$(ros2 pkg prefix hipnuc_msgs)" = "$PWD/ws/install/hipnuc_msgs"
+          test -x ws/install/hipnuc_imu/lib/hipnuc_imu/serial_node
+          test -x ws/install/hipnuc_imu/lib/hipnuc_imu/can_node
+      - name: Run each node without hardware
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          source ws/install/setup.bash
+          # No device is attached, so each node must keep retrying instead of
+          # exiting, then shut down cleanly on SIGINT. wait reports its status.
+          # Signal the node itself: ros2 run would only forward from a terminal.
+          smoke() {
+            "ws/install/hipnuc_imu/lib/hipnuc_imu/$1" --ros-args -p "$2" &
+            local node=$!
+            sleep 5
+            kill -INT $node 2>/dev/null || true   # already gone: let wait report why
+            wait $node
+          }
+          smoke serial_node port:=/hipnuc_missing
+          smoke can_node interface:=hipnuc_missing
+
+  ros1-noetic:
+    runs-on: ubuntu-24.04
+    container: ros:noetic-ros-base
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ws/src/products
+      - name: Prepare ROS dependency index
+        shell: bash
+        run: |
+          apt-get update
+          # Noetic is EOL and must be explicitly included in the dependency index.
+          rosdep update --rosdistro noetic --include-eol-distros
+      - name: Build complete checkout with catkin
+        shell: bash
+        run: |
+          source /opt/ros/noetic/setup.bash
+          cd ws
+          rosdep install --from-paths src/products/ros/ros1/src --ignore-src -y
+          catkin_make --source src/products/ros/ros1/src -DCATKIN_ENABLE_TESTING=OFF
+          catkin_make --source src/products/ros/ros1/src install
+          source install/setup.bash
+          test "$(rospack find hipnuc_imu)" = "$PWD/install/share/hipnuc_imu"
+          test -x install/lib/hipnuc_imu/serial_node
+          test -x install/lib/hipnuc_imu/can_node
