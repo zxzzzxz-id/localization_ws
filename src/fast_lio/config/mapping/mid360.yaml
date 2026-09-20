@@ -109,6 +109,8 @@ pcd_save:
 diagnostics:
     odom_log_interval_sec: 1.0   # log odom -> base_link xyz[m] and rpy[deg]; 0 disables logging
     lidar_imu_time_diff_log_interval_sec: 2.0  # log corrected LiDAR/IMU stamp delta; 0 disables
+    imu_to_hf_odom_log_interval_sec: 1.0  # log same-stamp IMU publish -> /OdometryHighFreq publish latency; 0 disables
+    lidar_to_odom_log_interval_sec: 1.0  # log synchronized scan processing and LiDAR-end-stamp age; 0 disables
 
 reloc:
     reloc_en: false

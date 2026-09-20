@@ -92,6 +92,44 @@ ros2 launch fast_lio mapping_mid360.launch.py use_rviz:=false
 | `self_filter/*` | base_link 系下的固定 box 自车点过滤：`enable`、`box_min`、`box_max`（填最终尺寸，不依赖 URDF） |
 | `publish/*` | 点云、路径和调试输出开关 |
 | `diagnostics/odom_log_interval_sec` | XYZ/RPY 日志周期；`0` 为关闭 |
+| `diagnostics/imu_to_hf_odom_log_interval_sec` | 同时间戳 IMU 到 `/OdometryHighFreq` 的延迟日志周期（秒）；`0` 为关闭。每次记录该周期内最后一对匹配消息的延迟及匹配数量。`source_to_publish` 从 ROS 2 中间件记录的 IMU 发布时间算到本进程调用里程计 `publish()`，跨主机测量要求系统时钟同步；`callback_to_publish` 从 IMU 回调开始算起。仅统计直接由该帧 IMU 推出、时间戳完全相同的里程计；补推或时间戳前移的输出不计入。中间件未提供有效发布时间时显示 `unavailable`。 |
+| `diagnostics/lidar_to_odom_log_interval_sec` | `/Odometry` 延迟日志周期（秒）；`0` 为关闭。`scan_ready_to_publish` 用单调时钟量取雷达与 IMU 配齐后到调用 `publish()` 的处理耗时，未包含驱动、传输、点云回调预处理及等待 IMU。两条里程计日志中的 `stamp_to_publish` 是发布时系统时间减去消息 `header.stamp`；只有传感器时间戳和主机系统时钟同源或已同步时才可解释为数据年龄，仿真时间下不可直接比较。 |
+
+### Rosbag 延迟监测
+
+`mid360.yaml` 默认每秒输出一次 `/Odometry` 和 `/OdometryHighFreq` 的延迟日志。先确认 rosbag 包含配置里的 `/livox/lidar` 和 `/livox/imu`；回放时只启动 FAST-LIO，不启动 Livox 驱动或第二个 FAST-LIO 实例。
+
+终端 1，在工作区根目录启动 FAST-LIO 并保存屏幕日志：
+
+```bash
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+colcon build --packages-select fast_lio --symlink-install
+source install/setup.bash
+ros2 launch fast_lio mapping_mid360.launch.py use_rviz:=false 2>&1 | tee /tmp/fastlio_latency.log
+```
+
+终端 2，在 FAST-LIO 启动后回放一次（把路径替换成 rosbag 目录）：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/zxz/workspace/localization_self_ws/install/setup.bash
+ros2 bag info /path/to/bag
+ros2 bag play /path/to/bag --rate 1.0 --topics /livox/lidar /livox/imu
+```
+
+回放完查看结果：
+
+```bash
+rg 'LiDAR->Odometry|IMU->OdometryHighFreq' /tmp/fastlio_latency.log
+```
+
+- `LiDAR->Odometry scan_ready_to_publish`：雷达和 IMU 配齐后，到 `/Odometry` 调用 `publish()` 的处理耗时；rosbag 回放下可用。
+- `IMU->OdometryHighFreq callback_to_publish`：IMU 回调开始后，到同时间戳高频里程计调用 `publish()` 的耗时；rosbag 回放下可用。`matched=N/M` 表示这段日志周期内有 N 条高频里程计直接对应 IMU 时间戳，共发布 M 条。
+- `source_to_publish`：rosbag 回放发布 IMU 消息到高频里程计发布的耗时，包含传输和排队；这不是原始传感器录制时的发布耗时。若中间件没有提供有效发布时间，会显示 `unavailable`。
+- `stamp_to_publish`：发布时主机时间减去消息时间戳。旧 rosbag 的时间戳属于录制时刻，回放时这一项不可用来评价延迟。现场实时采集且传感器与主机时钟已同步时才看这一项。
+
+这些时间都截至 FAST-LIO 调用 `publish()`，不包含下游订阅者收到消息的时间。调日志周期可修改 `diagnostics/lidar_to_odom_log_interval_sec` 和 `diagnostics/imu_to_hf_odom_log_interval_sec`；`0` 关闭对应日志。
 
 ### 保存 PCD
 
