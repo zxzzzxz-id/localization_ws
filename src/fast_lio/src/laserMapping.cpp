@@ -63,6 +63,8 @@ string imu_frame = "imu_link";
 string lidar_frame = "livox_frame";
 double odom_log_interval_sec = 1.0;
 double lidar_imu_time_diag_interval_sec = 2.0;
+double imu_to_hf_odom_log_interval_sec = 0.0;
+double lidar_to_odom_log_interval_sec = 0.0;
 
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
@@ -164,8 +166,11 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 struct ImuRawSample
 {
     double timestamp = 0.0;   // synced IMU time [s]
+    builtin_interfaces::msg::Time corrected_stamp;
     V3D    gyro = Zero3d;     // raw angular velocity [rad/s]
     V3D    acc  = Zero3d;     // raw linear acceleration [m/s^2]
+    int64_t source_timestamp_ns = 0; // middleware publish time, if available
+    std::chrono::steady_clock::time_point callback_time;
 };
 
 struct HighFreqBase
@@ -601,8 +606,12 @@ void livox_pcl_cbk(const LivoxCustomMsgConstPtr &msg)
     sig_buffer.notify_all();
 }
 
-void imu_cbk(const ImuMsgConstPtr &msg_in) 
+void imu_cbk(const ImuMsgConstPtr &msg_in, const rclcpp::MessageInfo &info)
 {   
+    std::chrono::steady_clock::time_point callback_time;
+    if (imu_to_hf_odom_log_interval_sec > 0.0) {
+        callback_time = std::chrono::steady_clock::now();
+    }
     publish_count ++;
     // cout<<"IMU got at: "<<get_ros_time_sec(msg_in->header.stamp)<<endl;
     ImuMsgPtr msg(new ImuMsg(*msg_in));
@@ -641,6 +650,11 @@ void imu_cbk(const ImuMsgConstPtr &msg_in)
         }
         ImuRawSample sample;
         sample.timestamp = timestamp;
+        sample.corrected_stamp = msg->header.stamp;
+        if (imu_to_hf_odom_log_interval_sec > 0.0) {
+            sample.source_timestamp_ns = info.get_rmw_message_info().source_timestamp;
+            sample.callback_time = callback_time;
+        }
         sample.gyro << msg->angular_velocity.x,
                        msg->angular_velocity.y,
                        msg->angular_velocity.z;
@@ -944,6 +958,12 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
     double time_since_integration = 0.0;
     bool   integrated_this_tick = false;
     double last_published_ts = -1.0;
+    auto last_latency_log = std::chrono::steady_clock::time_point{};
+    std::size_t latency_outputs = 0, latency_matches = 0;
+    builtin_interfaces::msg::Time latest_imu_stamp, latest_odom_stamp;
+    double latest_callback_ms = 0.0, latest_source_ms = 0.0;
+    double latest_match_stamp_age_ms = 0.0, latest_output_stamp_age_ms = 0.0;
+    bool latest_source_valid = false;
 
     while (ros_ok() && !flg_exit)
     {
@@ -984,6 +1004,7 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         // model (get_f in use-ikfom.hpp) plus the accelerometer G-scaling
         // applied in IMU_Processing.hpp:413. Bias states are constant
         // between corrections, exactly as in the EKF.
+        const ImuRawSample *latest_integrated_imu = nullptr;
         for (const auto &s : samples)
         {
             const double dt = s.timestamp - state_ts;
@@ -998,6 +1019,7 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
             last_gyro = s.gyro;
             last_acc  = s.acc;
             have_last_imu = true;
+            latest_integrated_imu = &s;
             integrated_this_tick = true;
             time_since_integration = 0.0;
             if (prev_sample_ts > 0.0) {
@@ -1030,6 +1052,9 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
             state_ts += dt_fill;
         }
 
+        bool exact_imu_stamp = latest_integrated_imu != nullptr &&
+                               state_ts == latest_integrated_imu->timestamp;
+
         // Keep the stream strictly monotonic. At a scan correction the base
         // is re-seeded from the (slightly older) scan-end state, so the
         // re-predicted pose can land behind the last published timestamp.
@@ -1039,6 +1064,7 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         // jump is spread over a normal step instead of producing a
         // velocity spike.
         if (last_published_ts > 0.0 && state_ts <= last_published_ts) {
+            exact_imu_stamp = false;
             const double dt_bump = last_published_ts + period_ema - state_ts;
             if (have_last_imu && dt_bump > 0.0) {
                 const V3D acc_norm = last_acc * acc_scale;
@@ -1053,7 +1079,11 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         last_published_ts = state_ts;
 
         OdomMsg msg;
-        msg.header.stamp = get_ros_time(state_ts);
+        if (exact_imu_stamp) {
+            msg.header.stamp = latest_integrated_imu->corrected_stamp;
+        } else {
+            msg.header.stamp = get_ros_time(state_ts);
+        }
         msg.header.frame_id = odom_frame;
         msg.child_frame_id = robot_hf_frame;
 
@@ -1094,7 +1124,64 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         msg.twist.twist.angular.x = angular_vel_body.x();
         msg.twist.twist.angular.y = angular_vel_body.y();
         msg.twist.twist.angular.z = angular_vel_body.z();
+        const auto publish_time = std::chrono::steady_clock::now();
+        int64_t publish_wall_ns = 0;
+        if (imu_to_hf_odom_log_interval_sec > 0.0) {
+            publish_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        }
         ros_publish(pubOdomHighFreq, msg);
+
+        if (imu_to_hf_odom_log_interval_sec > 0.0) {
+            ++latency_outputs;
+            latest_output_stamp_age_ms =
+                (publish_wall_ns - rclcpp::Time(msg.header.stamp).nanoseconds()) * 1e-6;
+            if (exact_imu_stamp) {
+                ++latency_matches;
+                latest_imu_stamp = latest_integrated_imu->corrected_stamp;
+                latest_odom_stamp = msg.header.stamp;
+                latest_match_stamp_age_ms = latest_output_stamp_age_ms;
+                latest_callback_ms = std::chrono::duration<double, std::milli>(
+                    publish_time - latest_integrated_imu->callback_time).count();
+                const int64_t source_ns = latest_integrated_imu->source_timestamp_ns;
+                latest_source_valid = source_ns > 0 && publish_wall_ns >= source_ns;
+                if (latest_source_valid) {
+                    latest_source_ms = (publish_wall_ns - source_ns) * 1e-6;
+                }
+            }
+            if (last_latency_log.time_since_epoch().count() == 0 ||
+                publish_time - last_latency_log >=
+                    std::chrono::duration<double>(imu_to_hf_odom_log_interval_sec)) {
+                if (latency_matches > 0) {
+                    if (latest_source_valid) {
+                        ROS_PRINT_INFO(
+                            "IMU->OdometryHighFreq same stamp: imu=%d.%09u odom=%d.%09u "
+                            "source_to_publish=%.3f ms callback_to_publish=%.3f ms "
+                            "stamp_to_publish=%.3f ms matched=%zu/%zu",
+                            latest_imu_stamp.sec, latest_imu_stamp.nanosec,
+                            latest_odom_stamp.sec, latest_odom_stamp.nanosec, latest_source_ms,
+                            latest_callback_ms, latest_match_stamp_age_ms,
+                            latency_matches, latency_outputs);
+                    } else {
+                        ROS_PRINT_INFO(
+                            "IMU->OdometryHighFreq same stamp: imu=%d.%09u odom=%d.%09u "
+                            "source_to_publish=unavailable callback_to_publish=%.3f ms "
+                            "stamp_to_publish=%.3f ms matched=%zu/%zu",
+                            latest_imu_stamp.sec, latest_imu_stamp.nanosec,
+                            latest_odom_stamp.sec, latest_odom_stamp.nanosec, latest_callback_ms,
+                            latest_match_stamp_age_ms, latency_matches, latency_outputs);
+                    }
+                } else {
+                    ROS_PRINT_INFO(
+                        "IMU->OdometryHighFreq: no exact IMU/odom stamp match in %zu outputs; "
+                        "latest_stamp_to_publish=%.3f ms (fill or timestamp bump)",
+                        latency_outputs, latest_output_stamp_age_ms);
+                }
+                last_latency_log = publish_time;
+                latency_outputs = 0;
+                latency_matches = 0;
+            }
+        }
 
         geometry_msgs::msg::TransformStamped tf_msg;
         tf_msg.header.stamp = msg.header.stamp;
@@ -1125,7 +1212,9 @@ void set_posestamp(T & out)
     out.pose.orientation.w = robot_pose.rotation.w();
 }
 
-void publish_odometry(const OdomPublisher & pubOdomAftMapped, double timestamp = -1.0)
+void publish_odometry(
+    const OdomPublisher &pubOdomAftMapped, double timestamp = -1.0,
+    std::chrono::steady_clock::time_point scan_ready_time = {})
 {
     odomAftMapped.header.frame_id = odom_frame;
     odomAftMapped.child_frame_id = robot_frame;
@@ -1178,7 +1267,33 @@ void publish_odometry(const OdomPublisher & pubOdomAftMapped, double timestamp =
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
+    std::chrono::steady_clock::time_point publish_time;
+    int64_t publish_wall_ns = 0;
+    const bool log_latency = lidar_to_odom_log_interval_sec > 0.0 &&
+                             scan_ready_time.time_since_epoch().count() != 0;
+    if (log_latency) {
+        publish_time = std::chrono::steady_clock::now();
+        publish_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
     ros_publish(pubOdomAftMapped, odomAftMapped);
+    if (log_latency) {
+        static auto last_latency_log = std::chrono::steady_clock::time_point{};
+        if (last_latency_log.time_since_epoch().count() == 0 ||
+            publish_time - last_latency_log >=
+                std::chrono::duration<double>(lidar_to_odom_log_interval_sec)) {
+            const double processing_ms = std::chrono::duration<double, std::milli>(
+                publish_time - scan_ready_time).count();
+            const double stamp_age_ms =
+                (publish_wall_ns - rclcpp::Time(odomAftMapped.header.stamp).nanoseconds()) * 1e-6;
+            ROS_PRINT_INFO(
+                "LiDAR->Odometry: scan_ready_to_publish=%.3f ms "
+                "stamp_to_publish=%.3f ms stamp=%d.%09u",
+                processing_ms, stamp_age_ms,
+                odomAftMapped.header.stamp.sec, odomAftMapped.header.stamp.nanosec);
+            last_latency_log = publish_time;
+        }
+    }
 
     static auto br = std::make_shared<tf2_ros::TransformBroadcaster>(get_ros_node());
 
@@ -1367,6 +1482,8 @@ int main(int argc, char** argv)
     rosparam_get("odometry/zero_at_start", zero_odom_at_start, true);
     rosparam_get("diagnostics/odom_log_interval_sec", odom_log_interval_sec, 1.0);
     rosparam_get("diagnostics/lidar_imu_time_diff_log_interval_sec", lidar_imu_time_diag_interval_sec, 2.0);
+    rosparam_get("diagnostics/imu_to_hf_odom_log_interval_sec", imu_to_hf_odom_log_interval_sec, 0.0);
+    rosparam_get("diagnostics/lidar_to_odom_log_interval_sec", lidar_to_odom_log_interval_sec, 0.0);
     rosparam_get("reloc/reloc_topic", reloc_topic, std::string("/reloc/cloud_align"));
     rosparam_get("common/time_sync_en", time_sync_en, false);
     rosparam_get("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
@@ -1426,6 +1543,14 @@ int main(int argc, char** argv)
     if (!std::isfinite(lidar_imu_time_diag_interval_sec) || lidar_imu_time_diag_interval_sec < 0.0) {
         ROS_PRINT_WARN("diagnostics/lidar_imu_time_diff_log_interval_sec must be >= 0; disabling stamp delta logs.");
         lidar_imu_time_diag_interval_sec = 0.0;
+    }
+    if (!std::isfinite(imu_to_hf_odom_log_interval_sec) || imu_to_hf_odom_log_interval_sec < 0.0) {
+        ROS_PRINT_WARN("diagnostics/imu_to_hf_odom_log_interval_sec must be >= 0; disabling latency logs.");
+        imu_to_hf_odom_log_interval_sec = 0.0;
+    }
+    if (!std::isfinite(lidar_to_odom_log_interval_sec) || lidar_to_odom_log_interval_sec < 0.0) {
+        ROS_PRINT_WARN("diagnostics/lidar_to_odom_log_interval_sec must be >= 0; disabling latency logs.");
+        lidar_to_odom_log_interval_sec = 0.0;
     }
     hf_imu_buffer_capacity = std::max<std::size_t>(
         256, static_cast<std::size_t>(std::ceil(imu_nominal_rate_hz * 0.5)));
@@ -1686,6 +1811,7 @@ int main(int argc, char** argv)
                 flg_first_scan = false;
                 continue;
             }
+            const auto scan_ready_time = std::chrono::steady_clock::now();
 
             double t0, t1, t2, t3, t5;
 
@@ -1787,7 +1913,7 @@ int main(int argc, char** argv)
             double t_update_end = omp_get_wtime();
             
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped);
+            publish_odometry(pubOdomAftMapped, -1.0, scan_ready_time);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
