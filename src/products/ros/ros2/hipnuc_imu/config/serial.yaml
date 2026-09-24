@@ -5,3 +5,6 @@
     publish_mag: true
     publish_temperature: true
     publish_hipnuc: true
+    # HI81 synchronized UTC becomes the ROS header stamp. Invalid UTC falls
+    # back to host time and is reported in /diagnostics.
+    timestamp_source: device_utc

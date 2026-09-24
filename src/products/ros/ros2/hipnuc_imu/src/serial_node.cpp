@@ -1,5 +1,6 @@
 // One decoded frame produces one sample. No cross-frame measurement cache.
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,39 @@
 
 using SteadyClock = std::chrono::steady_clock;
 
+namespace {
+
+// Gregorian calendar date to days since 1970-01-01. This avoids process-wide
+// timezone state and keeps the device UTC conversion independent of local time.
+int64_t days_from_civil(int year, unsigned month, unsigned day)
+{
+    year -= month <= 2;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned year_of_era = static_cast<unsigned>(year - era * 400);
+    const unsigned adjusted_month = month > 2 ? month - 3 : month + 9;
+    const unsigned day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    const unsigned day_of_era =
+        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    return static_cast<int64_t>(era) * 146097 + day_of_era - 719468;
+}
+
+bool device_utc_stamp(const hipnuc_sample_t &sample, rclcpp::Time &stamp)
+{
+    if (!(sample.valid & HIPNUC_VALID_UTC) || !hipnuc_utc_is_valid(&sample.utc)) return false;
+
+    const auto &utc = sample.utc;
+    const int64_t seconds =
+        days_from_civil(utc.year, utc.month, utc.day) * 86400 +
+        static_cast<int64_t>(utc.hour) * 3600 +
+        static_cast<int64_t>(utc.minute) * 60 + utc.second;
+    const int64_t nanoseconds = seconds * 1000000000LL +
+        static_cast<int64_t>(utc.millisecond) * 1000000LL;
+    stamp = rclcpp::Time(nanoseconds, RCL_SYSTEM_TIME);
+    return true;
+}
+
+}  // namespace
+
 class SerialNode : public rclcpp::Node {
 public:
     SerialNode() : Node("hipnuc_serial")
@@ -34,8 +68,11 @@ public:
         publish_mag_ = declare_parameter<bool>("publish_mag", true, startup);
         publish_temperature_ = declare_parameter<bool>("publish_temperature", true, startup);
         publish_hipnuc_ = declare_parameter<bool>("publish_hipnuc", true, startup);
+        timestamp_source_ = declare_parameter<std::string>("timestamp_source", "host", startup);
         if (port_.empty() || baudrate_ <= 0 || frame_id_.empty())
             throw std::invalid_argument("port/frame_id must be nonempty and baudrate positive");
+        if (timestamp_source_ != "host" && timestamp_source_ != "device_utc")
+            throw std::invalid_argument("timestamp_source must be 'host' or 'device_utc'");
         rclcpp::PublisherOptions publisher_options;
         // Let a deployment relax reliability or depth without rebuilding, e.g.
         // qos_overrides./imu/data.publisher.reliability:=best_effort.
@@ -46,7 +83,10 @@ public:
         temp_pub_ = create_publisher<sensor_msgs::msg::Temperature>("imu/temperature", 10, publisher_options);
         full_pub_ = create_publisher<hipnuc_msgs::msg::HipnucImu>("hipnuc/imu", 100, publisher_options);
         diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
-        RCLCPP_INFO(get_logger(), "Requires device ENU output configuration; the driver does not verify or change it.");
+        RCLCPP_INFO(
+            get_logger(),
+            "Requires device ENU output configuration; timestamp_source=%s.",
+            timestamp_source_.c_str());
     }
 
     ~SerialNode() { hipnuc_serial_close(&serial_); }
@@ -99,11 +139,35 @@ public:
 private:
     void publish(const hipnuc_sample_t &s)
     {
-        const auto stamp = now();
+        const auto host_stamp = now();
+        auto stamp = host_stamp;
+        const bool sample_has_imu = hipnuc_ros::has_imu(s);
+        const bool sample_device_utc_valid =
+            (s.valid & HIPNUC_VALID_UTC) && hipnuc_utc_is_valid(&s.utc);
+        std::string sample_timestamp_source = "host";
+        if (timestamp_source_ == "device_utc") {
+            if (device_utc_stamp(s, stamp)) {
+                sample_timestamp_source = "device_utc";
+            } else {
+                sample_timestamp_source = "host_fallback";
+                if (sample_has_imu) {
+                    ++device_utc_fallback_frames_;
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 5000,
+                        "device_utc requested but this IMU sample has no synchronized UTC; using host ROS time");
+                }
+            }
+        }
+        if (sample_has_imu) {
+            last_device_utc_valid_ = sample_device_utc_valid;
+            last_timestamp_source_ = sample_timestamp_source;
+            last_host_minus_stamp_sec_ =
+                static_cast<double>(host_stamp.nanoseconds() - stamp.nanoseconds()) * 1e-9;
+        }
         ++frames_;
         last_frame_ = SteadyClock::now();
         received_sample_ = true;
-        if (publish_imu_ && hipnuc_ros::has_imu(s)) {
+        if (publish_imu_ && sample_has_imu) {
             sensor_msgs::msg::Imu m;
             m.header.stamp = stamp;
             m.header.frame_id = frame_id_;
@@ -170,6 +234,11 @@ private:
         kv("connection_receive_errors", std::to_string(serial_.receive_errors));
         kv("connection_invalid_frames", std::to_string(serial_.binary.invalid_count));
         kv("connection_nmea_checksum_errors", std::to_string(serial_.nmea.checksum_error_count));
+        kv("timestamp_source_config", timestamp_source_);
+        kv("last_timestamp_source", last_timestamp_source_);
+        kv("device_utc_valid", last_device_utc_valid_ ? "true" : "false");
+        kv("device_utc_fallback_frames", std::to_string(device_utc_fallback_frames_));
+        kv("host_minus_stamp_sec", std::to_string(last_host_minus_stamp_sec_));
         kv("last_error", hipnuc_serial_last_error(&serial_));
         bytes_at_last_diag_ = serial_.bytes_received;
         frames_at_last_diag_ = frames_;
@@ -177,14 +246,18 @@ private:
         diag_pub_->publish(arr);
     }
 
-    std::string port_, frame_id_;
+    std::string port_, frame_id_, timestamp_source_;
     int baudrate_;
     bool publish_imu_, publish_mag_, publish_temperature_, publish_hipnuc_;
     hipnuc_serial_t serial_{};
     uint64_t frames_ = 0, frames_at_last_diag_ = 0;
     uint64_t bytes_at_last_diag_ = 0;
+    uint64_t device_utc_fallback_frames_ = 0;
     bool received_sample_ = false;
+    bool last_device_utc_valid_ = false;
     int last_level_ = -1;
+    double last_host_minus_stamp_sec_ = 0.0;
+    std::string last_timestamp_source_ = "none";
     SteadyClock::time_point last_frame_{};
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
     rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr mag_pub_;

@@ -127,10 +127,15 @@ Keep filter input and output topics distinct to prevent feedback. Unknown
 covariance is not enough for direct fusion: provide uncertainty appropriate to
 the application and consumer.
 
-Headers use the host ROS clock after decoding and before publication, not kernel
-reception or device sampling timestamps. `use_sim_time` defaults to `false`;
-enabling it requires a valid `/clock`. Transport and scheduling delays remain,
-so assess time synchronization for your fusion application.
+The ROS 2 serial node supports `timestamp_source=host` and
+`timestamp_source=device_utc`. `host` stamps after decoding and includes serial
+transport and scheduling delay. `device_utc` converts a synchronized full UTC
+date/time carried by the sample (for example HI81) to Unix/ROS time. Samples
+without `HIPNUC_VALID_UTC` fall back to host time and increment
+`device_utc_fallback_frames` in `/diagnostics`; wait for
+`last_timestamp_source=device_utc` before starting a fusion consumer. The ROS 1
+and CAN nodes continue to use their host ROS clock. `use_sim_time` defaults to
+`false`; device UTC should not be mixed with simulated time.
 
 Navigation position and velocity remain in the independent product message;
 standard navigation topics are not provided. The product message is not a
@@ -147,8 +152,9 @@ that use this message.
 
 ## Connection tips
 
-- `port`/`baudrate` (or `interface`/`node_id`) and `frame_id` (default
-  `imu_link`) are launch arguments. `params_file` defaults to the package's
+- `port`/`baudrate` (or `interface`/`node_id`), `frame_id` (default
+  `imu_link`) and ROS 2 serial `timestamp_source` are launch arguments.
+  `params_file` defaults to the package's
   `config/serial.yaml` or `config/can.yaml`, which holds the `publish_imu`,
   `publish_mag`, `publish_temperature` and `publish_hipnuc` switches.
 - Driver parameters are read at startup; restart the node after changing them.
