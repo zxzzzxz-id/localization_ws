@@ -12,3 +12,9 @@ calibration_logs/
 .DS_Store
 *.swp
 *.swo
+
+# Python build artifacts.
+__pycache__/
+.venv/
+dist/
+*.egg-info/

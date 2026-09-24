@@ -15,6 +15,7 @@ def generate_launch_description():
             DeclareLaunchArgument("port", default_value="/dev/ttyUSB0"),
             DeclareLaunchArgument("baudrate", default_value="115200"),
             DeclareLaunchArgument("frame_id", default_value="imu_link"),
+            DeclareLaunchArgument("timestamp_source", default_value="device_utc"),
             DeclareLaunchArgument("params_file", default_value=config),
             Node(
                 package="hipnuc_imu",
@@ -27,6 +28,9 @@ def generate_launch_description():
                         "port": LaunchConfiguration("port"),
                         "baudrate": ParameterValue(LaunchConfiguration("baudrate"), value_type=int),
                         "frame_id": ParameterValue(LaunchConfiguration("frame_id"), value_type=str),
+                        "timestamp_source": ParameterValue(
+                            LaunchConfiguration("timestamp_source"), value_type=str
+                        ),
                     },
                 ],
             ),
