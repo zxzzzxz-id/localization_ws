@@ -43,6 +43,11 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  void configure_orientation_observation(bool enabled, const V3D &stddev_rad,
+                                         double gate_chi2,
+                                         bool use_message_covariance,
+                                         const M3D &R_external_from_internal);
+  void ResetOrientationReference();
   void RebaseWorldFrame(const M3D &rotation_new_from_old);
 
   Eigen::Matrix<double, 12, 12> Q;
@@ -68,6 +73,8 @@ class ImuProcess
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
+  bool UpdateOrientationObservation(const ImuMsgConstPtr &imu,
+      esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
   ImuMsgConstPtr last_imu_;
@@ -85,6 +92,14 @@ class ImuProcess
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
+  bool   orientation_observation_enabled_ = false;
+  bool   orientation_reference_ready_ = false;
+  bool   orientation_use_message_covariance_ = false;
+  V3D    orientation_stddev_rad_ = V3D(0.0523598776, 0.0523598776, 0.1745329252);
+  double orientation_gate_chi2_ = 16.27;
+  M3D    R_odom_from_navigation_ = Eye3d;
+  M3D    R_external_from_internal_ = Eye3d;
+  std::size_t orientation_rejection_count_ = 0;
 };
 
 ImuProcess::ImuProcess()
@@ -113,9 +128,31 @@ void ImuProcess::RebaseWorldFrame(const M3D &rotation_new_from_old)
   // These cached quantities are expressed in the world frame. Keep them in
   // the same frame as the rebased EKF state before processing the next scan.
   acc_s_last = rotation_new_from_old * acc_s_last;
+  if (orientation_reference_ready_) {
+    R_odom_from_navigation_ = rotation_new_from_old * R_odom_from_navigation_;
+  }
   IMUpose.clear();
   pbuffer.Clear();
 }
+
+void ImuProcess::configure_orientation_observation(
+    bool enabled, const V3D &stddev_rad, double gate_chi2,
+    bool use_message_covariance, const M3D &R_external_from_internal)
+{
+  orientation_observation_enabled_ = enabled;
+  orientation_stddev_rad_ = stddev_rad;
+  orientation_gate_chi2_ = gate_chi2;
+  orientation_use_message_covariance_ = use_message_covariance;
+  R_external_from_internal_ = R_external_from_internal;
+}
+
+void ImuProcess::ResetOrientationReference()
+{
+  orientation_reference_ready_ = false;
+  R_odom_from_navigation_ = Eye3d;
+  orientation_rejection_count_ = 0;
+}
+
 
 void ImuProcess::Reset() 
 {
@@ -132,6 +169,7 @@ void ImuProcess::Reset()
   v_imu_.clear();
   IMUpose.clear();
   pbuffer.Clear();
+  ResetOrientationReference();
   last_imu_.reset(new ImuMsg());
   cur_pcl_un_.reset(new PointCloudXYZI());
 }
@@ -161,6 +199,76 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a)
 {
   cov_bias_acc = b_a;
 }
+
+bool ImuProcess::UpdateOrientationObservation(
+    const ImuMsgConstPtr &imu,
+    esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state)
+{
+  if (!orientation_observation_enabled_ || imu->orientation_covariance[0] < 0.0) return false;
+  Eigen::Quaterniond q_navigation_from_imu(
+      imu->orientation.w, imu->orientation.x, imu->orientation.y, imu->orientation.z);
+  if (!q_navigation_from_imu.coeffs().allFinite() ||
+      q_navigation_from_imu.squaredNorm() < 1e-12) return false;
+  q_navigation_from_imu.normalize();
+
+  const state_ikfom &current_state = kf_state.get_x();
+  const M3D R_odom_from_imu = current_state.rot.toRotationMatrix();
+  const M3D R_navigation_from_imu = q_navigation_from_imu.toRotationMatrix() * R_external_from_internal_;
+  if (!orientation_reference_ready_) {
+    // AHRS is body -> navigation (ENU); FAST-LIO owns an arbitrary odom frame.
+    R_odom_from_navigation_ = R_odom_from_imu * R_navigation_from_imu.transpose();
+    orientation_reference_ready_ = true;
+    ROS_PRINT_INFO("IMU orientation observation reference initialized (navigation -> odom).");
+    return false;
+  }
+
+  const M3D R_measurement = R_odom_from_navigation_ * R_navigation_from_imu;
+  const V3D residual = Log((R_odom_from_imu.transpose() * R_measurement).eval());
+  M3D measurement_covariance = orientation_stddev_rad_.array().square().matrix().asDiagonal();
+  if (orientation_use_message_covariance_) {
+    M3D message_covariance;
+    for (int row = 0; row < 3; ++row) {
+      for (int col = 0; col < 3; ++col)
+        message_covariance(row, col) = imu->orientation_covariance[row * 3 + col];
+    }
+    Eigen::LDLT<M3D> message_covariance_ldlt(message_covariance);
+    if (message_covariance.allFinite() && message_covariance_ldlt.info() == Eigen::Success &&
+        (message_covariance.diagonal().array() > 0.0).all())
+      measurement_covariance = message_covariance;
+  }
+
+  using Filter = esekfom::esekf<state_ikfom, 12, input_ikfom>;
+  Filter::cov covariance = kf_state.get_P();
+  Eigen::Matrix<double, 3, state_ikfom::DOF> H =
+      Eigen::Matrix<double, 3, state_ikfom::DOF>::Zero();
+  H.block<3, 3>(0, 3).setIdentity();
+  const M3D innovation_covariance = H * covariance * H.transpose() + measurement_covariance;
+  const Eigen::LDLT<M3D> innovation_solver(innovation_covariance);
+  if (innovation_solver.info() != Eigen::Success) return false;
+  const double nis = residual.dot(innovation_solver.solve(residual));
+  if (!std::isfinite(nis) || nis > orientation_gate_chi2_) {
+    ++orientation_rejection_count_;
+    if (orientation_rejection_count_ == 1 || orientation_rejection_count_ % 200 == 0)
+      ROS_PRINT_WARN("Rejected IMU orientation: NIS=%.3f gate=%.3f (rejected=%zu).",
+                     nis, orientation_gate_chi2_, orientation_rejection_count_);
+    return false;
+  }
+
+  const Eigen::Matrix<double, state_ikfom::DOF, 3> kalman_gain =
+      covariance * H.transpose() * innovation_solver.solve(M3D::Identity());
+  Filter::vectorized_state correction = kalman_gain * residual;
+  state_ikfom corrected_state = current_state;
+  corrected_state.boxplus(correction);
+  const Filter::cov I_KH = Filter::cov::Identity() - kalman_gain * H;
+  Filter::cov corrected_covariance =
+      I_KH * covariance * I_KH.transpose() +
+      kalman_gain * measurement_covariance * kalman_gain.transpose();
+  corrected_covariance = 0.5 * (corrected_covariance + corrected_covariance.transpose());
+  kf_state.change_x(corrected_state);
+  kf_state.change_P(corrected_covariance);
+  return true;
+}
+
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
 {
@@ -254,6 +362,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   M3D R_imu;
 
   double dt = 0;
+  std::size_t orientation_index = 0;
 
   input_ikfom in;
   for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
@@ -293,6 +402,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
     kf_state.predict(dt, Q, in);
+    while (orientation_index < meas.orientation.size() &&
+           get_ros_time_sec(meas.orientation[orientation_index]->header.stamp) <= tail_time) {
+      UpdateOrientationObservation(meas.orientation[orientation_index++], kf_state);
+    }
 
     /* save the pose at each IMU measurement for undistortion */
     imu_state = kf_state.get_x();
@@ -310,6 +423,9 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
   kf_state.predict(dt, Q, in);
+  while (orientation_index < meas.orientation.size()) {
+    UpdateOrientationObservation(meas.orientation[orientation_index++], kf_state);
+  }
 
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();
