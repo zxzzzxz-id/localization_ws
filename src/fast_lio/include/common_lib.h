@@ -69,6 +69,7 @@ struct MeasureGroup     // Lidar data and imu dates for the curent process
     };
     double lidar_beg_time;
     double lidar_end_time;
+    deque<ImuMsgConstPtr> orientation;
     PointCloudXYZI::Ptr lidar;
     deque<ImuMsgConstPtr> imu;
 };

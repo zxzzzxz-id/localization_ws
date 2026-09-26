@@ -52,7 +52,7 @@ mutex mtx_odom_output;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string lid_topic, imu_topic;
+string lid_topic, imu_topic, orientation_topic;
 string imu_source = "livox";
 string reloc_topic;
 string odom_frame = "odom";
@@ -62,9 +62,6 @@ string imu_frame = "imu_link";
 // 默认与 Livox 驱动消息的 frame_id 一致；实际取值由 YAML 的 frames/lidar 覆盖。
 string lidar_frame = "livox_frame";
 double odom_log_interval_sec = 1.0;
-double lidar_imu_time_diag_interval_sec = 2.0;
-double imu_to_hf_odom_log_interval_sec = 0.0;
-double lidar_to_odom_log_interval_sec = 0.0;
 
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
@@ -80,9 +77,11 @@ bool reloc_en = false;
 bool imu_extrinsic_calibrated = true;
 bool imu_time_sync_verified = true;
 double imu_nominal_rate_hz = 200.0;
-double high_freq_odom_rate_hz = 200.0;
-double high_freq_fill_timeout_sec = 0.2;
-std::size_t hf_imu_buffer_capacity = 256;
+bool imu_orientation_observation_en = false;
+bool imu_orientation_use_message_covariance = false;
+std::vector<double> imu_orientation_stddev_deg{3.0, 3.0, 10.0};
+double imu_orientation_gate_chi2 = 16.27;
+std::vector<double> orientation_external_to_internal_R{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
 // 自车几何滤波：只使用 YAML 内置 box。
 bool self_filter_en = false;
 std::vector<double> self_filter_box_min{-0.4, -0.4, -0.05};
@@ -108,6 +107,8 @@ vector<double>       param_R_lidar_in_robot = {1.0, 0.0, 0.0,
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<ImuMsgConstPtr> imu_buffer;
+deque<ImuMsgConstPtr> orientation_buffer;
+double last_timestamp_orientation = -1.0;
 
 mutex mtx_reloc;
 RelocState reloc_state;
@@ -160,17 +161,14 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 // scan end (and at rebase / relocalization); the publish thread then
 // re-predicts forward from that base using every IMU sample that arrives
 // afterwards, with the same kinematics as the EKF process model. This makes
-// /OdometryHighFreq advance with a configurable publish cadence.
+// /OdometryHighFreq advance at the true IMU rate (uniform 200 Hz output)
 // instead of only updating once per LiDAR scan.
 // ------------------------------------------------------------------
 struct ImuRawSample
 {
     double timestamp = 0.0;   // synced IMU time [s]
-    builtin_interfaces::msg::Time corrected_stamp;
     V3D    gyro = Zero3d;     // raw angular velocity [rad/s]
     V3D    acc  = Zero3d;     // raw linear acceleration [m/s^2]
-    int64_t source_timestamp_ns = 0; // middleware publish time, if available
-    std::chrono::steady_clock::time_point callback_time;
 };
 
 struct HighFreqBase
@@ -522,27 +520,6 @@ inline void warn_if_self_filter_pending()
         p_pre->blind);
 }
 
-void log_lidar_imu_time_delta_locked(const char *event)
-{
-    if (lidar_imu_time_diag_interval_sec <= 0.0 ||
-        last_timestamp_lidar <= 0.0 || last_timestamp_imu <= 0.0) {
-        return;
-    }
-    static auto last_log_time = std::chrono::steady_clock::time_point{};
-    const auto now = std::chrono::steady_clock::now();
-    if (last_log_time.time_since_epoch().count() != 0 &&
-        now - last_log_time < std::chrono::duration<double>(lidar_imu_time_diag_interval_sec)) {
-        return;
-    }
-    last_log_time = now;
-    const double lidar_minus_imu = last_timestamp_lidar - last_timestamp_imu;
-    ROS_PRINT_INFO(
-        "LiDAR/IMU stamp delta after correction [%s]: lidar %.9f - imu %.9f = %.6f s; "
-        "FAST-LIO applies corrected_imu_stamp=input_imu_stamp-%.9f.",
-        event, last_timestamp_lidar, last_timestamp_imu, lidar_minus_imu,
-        time_diff_lidar_to_imu);
-}
-
 void standard_pcl_cbk(const Pcl2MsgConstPtr &msg) 
 {
     mtx_buffer.lock();
@@ -561,7 +538,6 @@ void standard_pcl_cbk(const Pcl2MsgConstPtr &msg)
     lidar_buffer.push_back(ptr);
     time_buffer.push_back(stamp_sec);
     last_timestamp_lidar = stamp_sec;
-    log_lidar_imu_time_delta_locked("lidar");
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -582,8 +558,7 @@ void livox_pcl_cbk(const LivoxCustomMsgConstPtr &msg)
         lidar_buffer.clear();
     }
     last_timestamp_lidar = stamp_sec;
-    log_lidar_imu_time_delta_locked("lidar");
-    
+
     if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
     {
         printf("IMU and LiDAR not Synced, IMU time: %lf, lidar header time: %lf \n",last_timestamp_imu, last_timestamp_lidar);
@@ -606,12 +581,8 @@ void livox_pcl_cbk(const LivoxCustomMsgConstPtr &msg)
     sig_buffer.notify_all();
 }
 
-void imu_cbk(const ImuMsgConstPtr &msg_in, const rclcpp::MessageInfo &info)
-{   
-    std::chrono::steady_clock::time_point callback_time;
-    if (imu_to_hf_odom_log_interval_sec > 0.0) {
-        callback_time = std::chrono::steady_clock::now();
-    }
+void imu_cbk(const ImuMsgConstPtr &msg_in)
+{
     publish_count ++;
     // cout<<"IMU got at: "<<get_ros_time_sec(msg_in->header.stamp)<<endl;
     ImuMsgPtr msg(new ImuMsg(*msg_in));
@@ -634,7 +605,6 @@ void imu_cbk(const ImuMsgConstPtr &msg_in, const rclcpp::MessageInfo &info)
     }
 
     last_timestamp_imu = timestamp;
-    log_lidar_imu_time_delta_locked("imu");
 
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
@@ -650,11 +620,6 @@ void imu_cbk(const ImuMsgConstPtr &msg_in, const rclcpp::MessageInfo &info)
         }
         ImuRawSample sample;
         sample.timestamp = timestamp;
-        sample.corrected_stamp = msg->header.stamp;
-        if (imu_to_hf_odom_log_interval_sec > 0.0) {
-            sample.source_timestamp_ns = info.get_rmw_message_info().source_timestamp;
-            sample.callback_time = callback_time;
-        }
         sample.gyro << msg->angular_velocity.x,
                        msg->angular_velocity.y,
                        msg->angular_velocity.z;
@@ -662,12 +627,30 @@ void imu_cbk(const ImuMsgConstPtr &msg_in, const rclcpp::MessageInfo &info)
                        msg->linear_acceleration.y,
                        msg->linear_acceleration.z;
         hf_base.imu_samples.push_back(sample);
-        while (hf_base.imu_samples.size() > hf_imu_buffer_capacity) {
+        while (hf_base.imu_samples.size() > 256) {
             hf_base.imu_samples.pop_front();
         }
     }
     sig_buffer.notify_all();
 }
+void orientation_cbk(const ImuMsgConstPtr &msg_in, const rclcpp::MessageInfo &)
+{
+    if (!imu_orientation_observation_en) return;
+    ImuMsgPtr msg(new ImuMsg(*msg_in));
+    const double input_stamp = get_ros_time_sec(msg_in->header.stamp);
+    msg->header.stamp = get_ros_time(input_stamp - time_diff_lidar_to_imu);
+    const double timestamp = get_ros_time_sec(msg->header.stamp);
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    if (timestamp < last_timestamp_orientation) {
+        orientation_buffer.clear();
+    }
+    last_timestamp_orientation = timestamp;
+    orientation_buffer.push_back(msg);
+    while (orientation_buffer.size() > 4000) {
+        orientation_buffer.pop_front();
+    }
+}
+
 
 /*** relocation callback ***/
 void reloc_cbk(const PoseStampedMsgConstPtr &msg_in) 
@@ -765,6 +748,13 @@ bool sync_packages(MeasureGroup &meas)
         meas.imu.push_back(imu_buffer.front());
         imu_buffer.pop_front();
     }
+    meas.orientation.clear();
+    while (!orientation_buffer.empty() &&
+           get_ros_time_sec(orientation_buffer.front()->header.stamp) <= lidar_end_time) {
+        meas.orientation.push_back(orientation_buffer.front());
+        orientation_buffer.pop_front();
+    }
+
 
     lidar_buffer.pop_front();
     time_buffer.pop_front();
@@ -931,11 +921,9 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
 {
     static auto br_hf = std::make_shared<tf2_ros::TransformBroadcaster>(get_ros_node());
 
-    // Configurable cadence: one pose per tick, re-predicted through every
+    // Fixed 200 Hz cadence: one pose per tick, re-predicted through every
     // IMU sample that arrived since the last scan-end correction.
-    const double publish_period_sec = 1.0 / high_freq_odom_rate_hz;
-    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-        std::chrono::duration<double>(publish_period_sec));
+    const std::chrono::milliseconds period(5);
     auto next_tick = std::chrono::steady_clock::now();
 
     // Local integrator state, re-seeded from hf_base whenever the corrected
@@ -952,25 +940,18 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
     // pose, plus a self-adapting estimate of the IMU sample period.
     bool   have_last_imu = false;
     V3D    last_gyro = Zero3d, last_acc = Zero3d;
-    const double nominal_imu_period_sec = 1.0 / imu_nominal_rate_hz;
-    double period_ema = nominal_imu_period_sec;        // typical IMU sample period [s]
+    double period_ema = 0.005;        // typical IMU sample period [s]
     double prev_sample_ts = -1.0;
-    double time_since_integration = 0.0;
+    int    ticks_since_integration = 0;
     bool   integrated_this_tick = false;
     double last_published_ts = -1.0;
-    auto last_latency_log = std::chrono::steady_clock::time_point{};
-    std::size_t latency_outputs = 0, latency_matches = 0;
-    builtin_interfaces::msg::Time latest_imu_stamp, latest_odom_stamp;
-    double latest_callback_ms = 0.0, latest_source_ms = 0.0;
-    double latest_match_stamp_age_ms = 0.0, latest_output_stamp_age_ms = 0.0;
-    bool latest_source_valid = false;
 
     while (ros_ok() && !flg_exit)
     {
         next_tick += period;
         std::this_thread::sleep_until(next_tick);
         integrated_this_tick = false;
-        time_since_integration += publish_period_sec;
+        ticks_since_integration++;
 
         std::vector<ImuRawSample> samples;
         {
@@ -1004,7 +985,6 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         // model (get_f in use-ikfom.hpp) plus the accelerometer G-scaling
         // applied in IMU_Processing.hpp:413. Bias states are constant
         // between corrections, exactly as in the EKF.
-        const ImuRawSample *latest_integrated_imu = nullptr;
         for (const auto &s : samples)
         {
             const double dt = s.timestamp - state_ts;
@@ -1019,13 +999,11 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
             last_gyro = s.gyro;
             last_acc  = s.acc;
             have_last_imu = true;
-            latest_integrated_imu = &s;
             integrated_this_tick = true;
-            time_since_integration = 0.0;
+            ticks_since_integration = 0;
             if (prev_sample_ts > 0.0) {
                 const double pdt = s.timestamp - prev_sample_ts;
-                if (pdt > std::max(0.0001, nominal_imu_period_sec * 0.25) &&
-                    pdt < std::min(0.1, nominal_imu_period_sec * 4.0)) {
+                if (pdt > 0.002 && pdt < 0.02) {
                     period_ema = 0.9 * period_ema + 0.1 * pdt;
                 }
             }
@@ -1040,9 +1018,10 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         // integrated for a while (IMU outage), the fill stops and the pose
         // holds instead of drifting.
         if (!integrated_this_tick && have_last_imu &&
-            time_since_integration <= high_freq_fill_timeout_sec)
+            ticks_since_integration <= 40)
         {
-            double dt_fill = std::min(0.8 * period_ema, 0.9 * nominal_imu_period_sec);
+            double dt_fill = 0.8 * period_ema;
+            if (dt_fill > 0.0045) dt_fill = 0.0045;
             const V3D acc_norm = last_acc * acc_scale;
             const V3D acc_w   = rot * (acc_norm - ba);
             const V3D gyro_c  = last_gyro - bg;
@@ -1051,9 +1030,6 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
             rot  = rot * Exp(gyro_c, dt_fill);
             state_ts += dt_fill;
         }
-
-        bool exact_imu_stamp = latest_integrated_imu != nullptr &&
-                               state_ts == latest_integrated_imu->timestamp;
 
         // Keep the stream strictly monotonic. At a scan correction the base
         // is re-seeded from the (slightly older) scan-end state, so the
@@ -1064,7 +1040,6 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         // jump is spread over a normal step instead of producing a
         // velocity spike.
         if (last_published_ts > 0.0 && state_ts <= last_published_ts) {
-            exact_imu_stamp = false;
             const double dt_bump = last_published_ts + period_ema - state_ts;
             if (have_last_imu && dt_bump > 0.0) {
                 const V3D acc_norm = last_acc * acc_scale;
@@ -1079,11 +1054,7 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         last_published_ts = state_ts;
 
         OdomMsg msg;
-        if (exact_imu_stamp) {
-            msg.header.stamp = latest_integrated_imu->corrected_stamp;
-        } else {
-            msg.header.stamp = get_ros_time(state_ts);
-        }
+        msg.header.stamp = get_ros_time(state_ts);
         msg.header.frame_id = odom_frame;
         msg.child_frame_id = robot_hf_frame;
 
@@ -1124,64 +1095,7 @@ void publish_odometryhighfreq(const OdomPublisher& pubOdomHighFreq)
         msg.twist.twist.angular.x = angular_vel_body.x();
         msg.twist.twist.angular.y = angular_vel_body.y();
         msg.twist.twist.angular.z = angular_vel_body.z();
-        const auto publish_time = std::chrono::steady_clock::now();
-        int64_t publish_wall_ns = 0;
-        if (imu_to_hf_odom_log_interval_sec > 0.0) {
-            publish_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-        }
         ros_publish(pubOdomHighFreq, msg);
-
-        if (imu_to_hf_odom_log_interval_sec > 0.0) {
-            ++latency_outputs;
-            latest_output_stamp_age_ms =
-                (publish_wall_ns - rclcpp::Time(msg.header.stamp).nanoseconds()) * 1e-6;
-            if (exact_imu_stamp) {
-                ++latency_matches;
-                latest_imu_stamp = latest_integrated_imu->corrected_stamp;
-                latest_odom_stamp = msg.header.stamp;
-                latest_match_stamp_age_ms = latest_output_stamp_age_ms;
-                latest_callback_ms = std::chrono::duration<double, std::milli>(
-                    publish_time - latest_integrated_imu->callback_time).count();
-                const int64_t source_ns = latest_integrated_imu->source_timestamp_ns;
-                latest_source_valid = source_ns > 0 && publish_wall_ns >= source_ns;
-                if (latest_source_valid) {
-                    latest_source_ms = (publish_wall_ns - source_ns) * 1e-6;
-                }
-            }
-            if (last_latency_log.time_since_epoch().count() == 0 ||
-                publish_time - last_latency_log >=
-                    std::chrono::duration<double>(imu_to_hf_odom_log_interval_sec)) {
-                if (latency_matches > 0) {
-                    if (latest_source_valid) {
-                        ROS_PRINT_INFO(
-                            "IMU->OdometryHighFreq same stamp: imu=%d.%09u odom=%d.%09u "
-                            "source_to_publish=%.3f ms callback_to_publish=%.3f ms "
-                            "stamp_to_publish=%.3f ms matched=%zu/%zu",
-                            latest_imu_stamp.sec, latest_imu_stamp.nanosec,
-                            latest_odom_stamp.sec, latest_odom_stamp.nanosec, latest_source_ms,
-                            latest_callback_ms, latest_match_stamp_age_ms,
-                            latency_matches, latency_outputs);
-                    } else {
-                        ROS_PRINT_INFO(
-                            "IMU->OdometryHighFreq same stamp: imu=%d.%09u odom=%d.%09u "
-                            "source_to_publish=unavailable callback_to_publish=%.3f ms "
-                            "stamp_to_publish=%.3f ms matched=%zu/%zu",
-                            latest_imu_stamp.sec, latest_imu_stamp.nanosec,
-                            latest_odom_stamp.sec, latest_odom_stamp.nanosec, latest_callback_ms,
-                            latest_match_stamp_age_ms, latency_matches, latency_outputs);
-                    }
-                } else {
-                    ROS_PRINT_INFO(
-                        "IMU->OdometryHighFreq: no exact IMU/odom stamp match in %zu outputs; "
-                        "latest_stamp_to_publish=%.3f ms (fill or timestamp bump)",
-                        latency_outputs, latest_output_stamp_age_ms);
-                }
-                last_latency_log = publish_time;
-                latency_outputs = 0;
-                latency_matches = 0;
-            }
-        }
 
         geometry_msgs::msg::TransformStamped tf_msg;
         tf_msg.header.stamp = msg.header.stamp;
@@ -1212,9 +1126,7 @@ void set_posestamp(T & out)
     out.pose.orientation.w = robot_pose.rotation.w();
 }
 
-void publish_odometry(
-    const OdomPublisher &pubOdomAftMapped, double timestamp = -1.0,
-    std::chrono::steady_clock::time_point scan_ready_time = {})
+void publish_odometry(const OdomPublisher & pubOdomAftMapped, double timestamp = -1.0)
 {
     odomAftMapped.header.frame_id = odom_frame;
     odomAftMapped.child_frame_id = robot_frame;
@@ -1267,33 +1179,7 @@ void publish_odometry(
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
 
-    std::chrono::steady_clock::time_point publish_time;
-    int64_t publish_wall_ns = 0;
-    const bool log_latency = lidar_to_odom_log_interval_sec > 0.0 &&
-                             scan_ready_time.time_since_epoch().count() != 0;
-    if (log_latency) {
-        publish_time = std::chrono::steady_clock::now();
-        publish_wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-    }
     ros_publish(pubOdomAftMapped, odomAftMapped);
-    if (log_latency) {
-        static auto last_latency_log = std::chrono::steady_clock::time_point{};
-        if (last_latency_log.time_since_epoch().count() == 0 ||
-            publish_time - last_latency_log >=
-                std::chrono::duration<double>(lidar_to_odom_log_interval_sec)) {
-            const double processing_ms = std::chrono::duration<double, std::milli>(
-                publish_time - scan_ready_time).count();
-            const double stamp_age_ms =
-                (publish_wall_ns - rclcpp::Time(odomAftMapped.header.stamp).nanoseconds()) * 1e-6;
-            ROS_PRINT_INFO(
-                "LiDAR->Odometry: scan_ready_to_publish=%.3f ms "
-                "stamp_to_publish=%.3f ms stamp=%d.%09u",
-                processing_ms, stamp_age_ms,
-                odomAftMapped.header.stamp.sec, odomAftMapped.header.stamp.nanosec);
-            last_latency_log = publish_time;
-        }
-    }
 
     static auto br = std::make_shared<tf2_ros::TransformBroadcaster>(get_ros_node());
 
@@ -1481,14 +1367,9 @@ int main(int argc, char** argv)
     rosparam_get("frames/lidar", lidar_frame, std::string("livox_frame"));
     rosparam_get("odometry/zero_at_start", zero_odom_at_start, true);
     rosparam_get("diagnostics/odom_log_interval_sec", odom_log_interval_sec, 1.0);
-    rosparam_get("diagnostics/lidar_imu_time_diff_log_interval_sec", lidar_imu_time_diag_interval_sec, 2.0);
-    rosparam_get("diagnostics/imu_to_hf_odom_log_interval_sec", imu_to_hf_odom_log_interval_sec, 0.0);
-    rosparam_get("diagnostics/lidar_to_odom_log_interval_sec", lidar_to_odom_log_interval_sec, 0.0);
     rosparam_get("reloc/reloc_topic", reloc_topic, std::string("/reloc/cloud_align"));
     rosparam_get("common/time_sync_en", time_sync_en, false);
     rosparam_get("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
-    rosparam_get("publish/high_freq_odom_rate_hz", high_freq_odom_rate_hz, 200.0);
-    rosparam_get("publish/high_freq_fill_timeout_sec", high_freq_fill_timeout_sec, 0.2);
     rosparam_get("filter_size_corner", filter_size_corner_min, 0.5);
     rosparam_get("filter_size_surf", filter_size_surf_min, 0.5);
     rosparam_get("filter_size_map", filter_size_map_min, 0.5);
@@ -1499,6 +1380,16 @@ int main(int argc, char** argv)
     rosparam_get("mapping/acc_cov", acc_cov, 0.1);
     rosparam_get("mapping/b_gyr_cov", b_gyr_cov, 0.0001);
     rosparam_get("mapping/b_acc_cov", b_acc_cov, 0.0001);
+    rosparam_get("orientation_observation/topic", orientation_topic,
+                 std::string("/external_imu/data_raw"));
+    rosparam_get("orientation_observation/enable", imu_orientation_observation_en, false);
+    rosparam_get("orientation_observation/external_to_internal_R",
+                 orientation_external_to_internal_R, std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0});
+    rosparam_get("orientation_observation/stddev_deg", imu_orientation_stddev_deg,
+                 std::vector<double>{3.0, 3.0, 10.0});
+    rosparam_get("orientation_observation/gate_chi2", imu_orientation_gate_chi2, 16.27);
+    rosparam_get("orientation_observation/use_message_covariance",
+                 imu_orientation_use_message_covariance, false);
     rosparam_get("preprocess/blind", p_pre->blind, 0.01);
     rosparam_get("preprocess/lidar_type", lidar_type, (int)AVIA);
     rosparam_get("preprocess/scan_line", p_pre->N_SCANS, 16);
@@ -1532,28 +1423,23 @@ int main(int argc, char** argv)
         ROS_PRINT_WARN("common/imu_nominal_rate_hz must be > 0; forcing 200 Hz.");
         imu_nominal_rate_hz = 200.0;
     }
-    if (!std::isfinite(high_freq_odom_rate_hz) || high_freq_odom_rate_hz <= 0.0) {
-        ROS_PRINT_WARN("publish/high_freq_odom_rate_hz must be > 0; using common/imu_nominal_rate_hz.");
-        high_freq_odom_rate_hz = imu_nominal_rate_hz;
+    if (imu_orientation_stddev_deg.size() != 3 ||
+        !is_finite_vector(imu_orientation_stddev_deg) ||
+        std::any_of(imu_orientation_stddev_deg.begin(), imu_orientation_stddev_deg.end(),
+                    [](double value) { return value <= 0.0; })) {
+        ROS_PRINT_ERROR("orientation_observation/stddev_deg must contain three positive values.");
+        return 1;
     }
-    if (!std::isfinite(high_freq_fill_timeout_sec) || high_freq_fill_timeout_sec < 0.0) {
-        ROS_PRINT_WARN("publish/high_freq_fill_timeout_sec must be >= 0; forcing 0.2 s.");
-        high_freq_fill_timeout_sec = 0.2;
+    if (!std::isfinite(imu_orientation_gate_chi2) || imu_orientation_gate_chi2 <= 0.0) {
+        ROS_PRINT_ERROR("orientation_observation/gate_chi2 must be positive.");
+        return 1;
     }
-    if (!std::isfinite(lidar_imu_time_diag_interval_sec) || lidar_imu_time_diag_interval_sec < 0.0) {
-        ROS_PRINT_WARN("diagnostics/lidar_imu_time_diff_log_interval_sec must be >= 0; disabling stamp delta logs.");
-        lidar_imu_time_diag_interval_sec = 0.0;
+    if (orientation_external_to_internal_R.size() != 9 ||
+        !is_finite_vector(orientation_external_to_internal_R) ||
+        !is_proper_rotation_matrix(orientation_external_to_internal_R)) {
+        ROS_PRINT_ERROR("orientation_observation/external_to_internal_R must be a proper 3x3 rotation.");
+        return 1;
     }
-    if (!std::isfinite(imu_to_hf_odom_log_interval_sec) || imu_to_hf_odom_log_interval_sec < 0.0) {
-        ROS_PRINT_WARN("diagnostics/imu_to_hf_odom_log_interval_sec must be >= 0; disabling latency logs.");
-        imu_to_hf_odom_log_interval_sec = 0.0;
-    }
-    if (!std::isfinite(lidar_to_odom_log_interval_sec) || lidar_to_odom_log_interval_sec < 0.0) {
-        ROS_PRINT_WARN("diagnostics/lidar_to_odom_log_interval_sec must be >= 0; disabling latency logs.");
-        lidar_to_odom_log_interval_sec = 0.0;
-    }
-    hf_imu_buffer_capacity = std::max<std::size_t>(
-        256, static_cast<std::size_t>(std::ceil(imu_nominal_rate_hz * 0.5)));
     if (imu_source == "external" && (!imu_extrinsic_calibrated || !imu_time_sync_verified)) {
         ROS_PRINT_ERROR(
             "external IMU mode is blocked: set sensor_extrinsic/calibrated=true only after real T_imu^lidar calibration, "
@@ -1613,10 +1499,10 @@ int main(int argc, char** argv)
         }
     }
     ROS_PRINT_INFO(
-        "IMU input: source=%s topic=%s frame=%s nominal_rate=%.1f Hz high_freq_odom=%.1f Hz "
-        "time_offset_lidar_to_imu=%.9f s (corrected_imu_stamp=input_imu_stamp-offset) buffer=%zu samples.",
+        "IMU input: source=%s topic=%s frame=%s nominal_rate=%.1f Hz "
+        "time_offset_lidar_to_imu=%.9f s (corrected_imu_stamp=input_imu_stamp-offset).",
         imu_source.c_str(), imu_topic.c_str(), imu_frame.c_str(), imu_nominal_rate_hz,
-        high_freq_odom_rate_hz, time_diff_lidar_to_imu, hf_imu_buffer_capacity);
+        time_diff_lidar_to_imu);
     if (extrinsic_est_en) {
         ROS_PRINT_WARN(
             "mapping/extrinsic_est_en=true: EKF T_lidar^imu may change while the public "
@@ -1672,6 +1558,18 @@ int main(int argc, char** argv)
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu->configure_orientation_observation(
+        imu_orientation_observation_en,
+        V3D(deg2rad(imu_orientation_stddev_deg[0]),
+            deg2rad(imu_orientation_stddev_deg[1]),
+            deg2rad(imu_orientation_stddev_deg[2])),
+        imu_orientation_gate_chi2, imu_orientation_use_message_covariance,
+        M3D(Eigen::Map<const M3D>(orientation_external_to_internal_R.data())));
+    ROS_PRINT_INFO(
+        "IMU orientation observation: %s, stddev_rpy=[%.2f %.2f %.2f] deg, gate=%.2f.",
+        imu_orientation_observation_en ? "enabled" : "disabled",
+        imu_orientation_stddev_deg[0], imu_orientation_stddev_deg[1],
+        imu_orientation_stddev_deg[2], imu_orientation_gate_chi2);
     p_imu->lidar_type = lidar_type;
     double epsi[23] = {0.001};
     fill(epsi, epsi+23, 0.001);
@@ -1710,6 +1608,10 @@ int main(int argc, char** argv)
         ROS_PRINT_INFO("reloc input enabled: %s [%s]", reloc_topic.c_str(), odom_frame.c_str());
     }
     auto sub_imu = create_subscriber_qos<ImuMsg>(imu_topic, imu_qos, imu_cbk);
+    rclcpp::Subscription<ImuMsg>::SharedPtr sub_orientation;
+    if (imu_orientation_observation_en) {
+        sub_orientation = create_subscriber_qos<ImuMsg>(orientation_topic, imu_qos, orientation_cbk);
+    }
 
     // 自车几何滤波：从 YAML 的 base_link box_min / box_max 立即建立。
     std::shared_ptr<fast_lio::RobotSelfFilter> self_filter;
@@ -1779,6 +1681,7 @@ int main(int argc, char** argv)
                 state_point_reloc.pos = requested_imu_pose.position;
                 state_point_reloc.rot = requested_imu_pose.rotation;
                 kf.reset(state_point_reloc);
+                p_imu->ResetOrientationReference();
                 state_point = state_point_reloc;
                 // Re-seed the high-frequency stream at the relocated pose; old
                 // buffered samples were removed by ImuProcess::Reset().
@@ -1811,8 +1714,6 @@ int main(int argc, char** argv)
                 flg_first_scan = false;
                 continue;
             }
-            const auto scan_ready_time = std::chrono::steady_clock::now();
-
             double t0, t1, t2, t3, t5;
 
             match_time = 0;
@@ -1913,7 +1814,7 @@ int main(int argc, char** argv)
             double t_update_end = omp_get_wtime();
             
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped, -1.0, scan_ready_time);
+            publish_odometry(pubOdomAftMapped);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();

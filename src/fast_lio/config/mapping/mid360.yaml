@@ -12,6 +12,21 @@ common:
     time_offset_lidar_to_imu: 0.0
     imu_time_sync_verified: true
 
+# Propagation remains on the built-in MID-360 IMU. The external IMU below is
+# subscribed only as an attitude observation source.
+orientation_observation:
+    enable: true
+    topic: "/imu/data"
+    stddev_deg: [3.0, 3.0, 10.0]
+    gate_chi2: 16.27
+    use_message_covariance: false
+    # R_external^internal: maps internal-IMU vectors into external-IMU vectors.
+    # Derived from the calibrated external-IMU -> LiDAR rotation and the
+    # MID-360 built-in IMU -> LiDAR identity rotation.
+    external_to_internal_R: [-0.023660,  0.999634, -0.013080 ,
+                       0.014667, 0.013429 , 0.999802,
+                       0.999612 , 0.023464 ,-0.014979]
+
 # FAST-LIO runtime/filter parameters.
 feature_extract_enable: false
 point_filter_num: 3
@@ -96,8 +111,6 @@ publish:
     scan_publish_en: true        # publish /cloud_registered
     dense_publish_en: false       # dense world-frame cloud; consumes more CPU and bandwidth
     scan_bodyframe_pub_en: true   # publish /cloud_registered_body for local voxel costmap
-    high_freq_odom_rate_hz: 200.0
-    high_freq_fill_timeout_sec: 0.2
     feature_pub_en: false
     effect_pub_en: false
 
@@ -108,9 +121,6 @@ pcd_save:
 
 diagnostics:
     odom_log_interval_sec: 1.0   # log odom -> base_link xyz[m] and rpy[deg]; 0 disables logging
-    lidar_imu_time_diff_log_interval_sec: 2.0  # log corrected LiDAR/IMU stamp delta; 0 disables
-    imu_to_hf_odom_log_interval_sec: 1.0  # log same-stamp IMU publish -> /OdometryHighFreq publish latency; 0 disables
-    lidar_to_odom_log_interval_sec: 1.0  # log synchronized scan processing and LiDAR-end-stamp age; 0 disables
 
 reloc:
     reloc_en: false
