@@ -1558,13 +1558,15 @@ int main(int argc, char** argv)
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
     p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    M3D R_external_from_internal;
+    R_external_from_internal << MAT_FROM_ARRAY(orientation_external_to_internal_R);
     p_imu->configure_orientation_observation(
         imu_orientation_observation_en,
         V3D(deg2rad(imu_orientation_stddev_deg[0]),
             deg2rad(imu_orientation_stddev_deg[1]),
             deg2rad(imu_orientation_stddev_deg[2])),
         imu_orientation_gate_chi2, imu_orientation_use_message_covariance,
-        M3D(Eigen::Map<const M3D>(orientation_external_to_internal_R.data())));
+        R_external_from_internal);
     ROS_PRINT_INFO(
         "IMU orientation observation: %s, stddev_rpy=[%.2f %.2f %.2f] deg, gate=%.2f.",
         imu_orientation_observation_en ? "enabled" : "disabled",

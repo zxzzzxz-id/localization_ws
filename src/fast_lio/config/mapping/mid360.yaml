@@ -21,11 +21,11 @@ orientation_observation:
     gate_chi2: 16.27
     use_message_covariance: false
     # R_external^internal: maps internal-IMU vectors into external-IMU vectors.
-    # Derived from the calibrated external-IMU -> LiDAR rotation and the
-    # MID-360 built-in IMU -> LiDAR identity rotation.
-    external_to_internal_R: [-0.023660,  0.999634, -0.013080 ,
-                       0.014667, 0.013429 , 0.999802,
-                       0.999612 , 0.023464 ,-0.014979]
+    # This is the calibrated LiDAR -> external-IMU rotation directly because
+    # the MID-360 built-in IMU axes are aligned with the LiDAR point-cloud axes.
+    external_to_internal_R: [-0.023660,  0.999634, -0.013080,
+                               0.014667,  0.013429,  0.999802,
+                               0.999612,  0.023464, -0.014979]
 
 # FAST-LIO runtime/filter parameters.
 feature_extract_enable: false
