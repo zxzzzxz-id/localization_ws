@@ -1,0 +1,9 @@
+pyserial<4,>=3.5
+click<9,>=8.1
+pymodbus<3.16,>=3.15
+
+[can]
+python-can<5,>=4.6
+
+[dev]
+ruff<1,>=0.11
