@@ -1,5 +1,7 @@
 #include <cmath>
 #include <math.h>
+#include <algorithm>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -71,6 +73,7 @@ class ImuProcess
   PoseBuffer pbuffer;
 
  private:
+  double gap_handler(double dt) const;
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
   bool UpdateOrientationObservation(const ImuMsgConstPtr &imu,
@@ -89,6 +92,7 @@ class ImuProcess
   V3D acc_s_last;
   double start_timestamp_;
   double last_lidar_end_time_;
+  double imu_gap_ = 0.5;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -122,6 +126,13 @@ ImuProcess::ImuProcess()
 }
 
 ImuProcess::~ImuProcess() {}
+
+double ImuProcess::gap_handler(double dt) const
+{
+  if (dt < 0.0 || dt > imu_gap_)
+    return -1.0;
+  return dt;
+}
 
 void ImuProcess::RebaseWorldFrame(const M3D &rotation_new_from_old)
 {
@@ -224,6 +235,33 @@ bool ImuProcess::UpdateOrientationObservation(
 
   const M3D R_measurement = R_odom_from_navigation_ * R_navigation_from_imu;
   const V3D residual = Log((R_odom_from_imu.transpose() * R_measurement).eval());
+  const auto rotation_to_rpy_deg = [](const M3D &rotation) {
+    const double pitch = std::asin(std::max(-1.0, std::min(1.0, -rotation(2, 0))));
+    const double roll = std::atan2(rotation(2, 1), rotation(2, 2));
+    const double yaw = std::atan2(rotation(1, 0), rotation(0, 0));
+    constexpr double kRadToDeg = 180.0 / M_PI;
+    return V3D(roll * kRadToDeg, pitch * kRadToDeg, yaw * kRadToDeg);
+  };
+  const auto maybe_log_orientation = [&](const char *status, double nis,
+                                          const M3D &filter_rotation) {
+    static std::chrono::steady_clock::time_point last_log_time;
+    const auto now = std::chrono::steady_clock::now();
+    if (last_log_time.time_since_epoch().count() != 0 &&
+        now - last_log_time < std::chrono::seconds(1))
+      return;
+    last_log_time = now;
+    const V3D raw_rpy_deg = rotation_to_rpy_deg(q_navigation_from_imu.toRotationMatrix());
+    const V3D transformed_rpy_deg = rotation_to_rpy_deg(R_measurement);
+    const V3D filter_rpy_deg = rotation_to_rpy_deg(filter_rotation);
+    ROS_PRINT_INFO(
+        "IMU RPY compare [%s] raw(nav)=(%.2f, %.2f, %.2f) deg "
+        "transformed(odom)=(%.2f, %.2f, %.2f) deg "
+        "fastlio(odom->imu)=(%.2f, %.2f, %.2f) deg NIS=%.3f",
+        status,
+        raw_rpy_deg.x(), raw_rpy_deg.y(), raw_rpy_deg.z(),
+        transformed_rpy_deg.x(), transformed_rpy_deg.y(), transformed_rpy_deg.z(),
+        filter_rpy_deg.x(), filter_rpy_deg.y(), filter_rpy_deg.z(), nis);
+  };
   M3D measurement_covariance = orientation_stddev_rad_.array().square().matrix().asDiagonal();
   if (orientation_use_message_covariance_) {
     M3D message_covariance;
@@ -248,6 +286,7 @@ bool ImuProcess::UpdateOrientationObservation(
   const double nis = residual.dot(innovation_solver.solve(residual));
   if (!std::isfinite(nis) || nis > orientation_gate_chi2_) {
     ++orientation_rejection_count_;
+    maybe_log_orientation("rejected", nis, R_odom_from_imu);
     if (orientation_rejection_count_ == 1 || orientation_rejection_count_ % 200 == 0)
       ROS_PRINT_WARN("Rejected IMU orientation: NIS=%.3f gate=%.3f (rejected=%zu).",
                      nis, orientation_gate_chi2_, orientation_rejection_count_);
@@ -266,6 +305,7 @@ bool ImuProcess::UpdateOrientationObservation(
   corrected_covariance = 0.5 * (corrected_covariance + corrected_covariance.transpose());
   kf_state.change_x(corrected_state);
   kf_state.change_P(corrected_covariance);
+  maybe_log_orientation("accepted", nis, corrected_state.rot.toRotationMatrix());
   return true;
 }
 
@@ -395,6 +435,10 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       dt = tail_time - head_time;
     }
 
+    dt = gap_handler(dt);
+    if (dt < 0.0)
+      continue;
+
     in.acc = acc_avr;
     in.gyro = angvel_avr;
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
@@ -422,6 +466,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   /*** calculated the pos and attitude prediction at the frame-end ***/
   double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
   dt = note * (pcl_end_time - imu_end_time);
+  dt = gap_handler(dt);
+  if (dt < 0.0)
+  {
+    last_imu_ = meas.imu.back();
+    last_lidar_end_time_ = pcl_end_time;
+    return;
+  }
   kf_state.predict(dt, Q, in);
   while (orientation_index < meas.orientation.size()) {
     UpdateOrientationObservation(meas.orientation[orientation_index++], kf_state);
