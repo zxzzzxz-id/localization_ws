@@ -63,7 +63,11 @@ string imu_frame = "imu_link";
 string lidar_frame = "livox_frame";
 double odom_log_interval_sec = 1.0;
 
-double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
+double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0;
+double last_raw_timestamp_lidar = -1.0, last_raw_timestamp_imu = -1.0;
+double imu_timestamp_offset_sec = 0.0;
+double imu_dt = 0.005;
+bool time_repair = true;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
@@ -526,18 +530,22 @@ void standard_pcl_cbk(const Pcl2MsgConstPtr &msg)
     warn_if_self_filter_pending();
     scan_count ++;
     double preprocess_start_time = omp_get_wtime();
-    const double stamp_sec = get_ros_time_sec(msg->header.stamp);
-    if (stamp_sec < last_timestamp_lidar)
+    const double raw_timestamp = get_ros_time_sec(msg->header.stamp);
+    const double corrected_timestamp = raw_timestamp + imu_timestamp_offset_sec;
+    if (last_timestamp_lidar >= 0.0 && corrected_timestamp <= last_timestamp_lidar)
     {
-        ROS_PRINT_ERROR("lidar loop back, clear buffer");
-        lidar_buffer.clear();
+        ROS_PRINT_WARN("drop non-monotonic lidar stamp: raw=%.9f corrected=%.9f last=%.9f",
+                       raw_timestamp, corrected_timestamp, last_timestamp_lidar);
+        mtx_buffer.unlock();
+        return;
     }
+    last_raw_timestamp_lidar = raw_timestamp;
+    last_timestamp_lidar = corrected_timestamp;
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
-    time_buffer.push_back(stamp_sec);
-    last_timestamp_lidar = stamp_sec;
+    time_buffer.push_back(corrected_timestamp);
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -551,13 +559,17 @@ void livox_pcl_cbk(const LivoxCustomMsgConstPtr &msg)
     warn_if_self_filter_pending();
     double preprocess_start_time = omp_get_wtime();
     scan_count ++;
-    const double stamp_sec = get_ros_time_sec(msg->header.stamp);
-    if (stamp_sec < last_timestamp_lidar)
+    const double raw_timestamp = get_ros_time_sec(msg->header.stamp);
+    const double corrected_timestamp = raw_timestamp + imu_timestamp_offset_sec;
+    if (last_timestamp_lidar >= 0.0 && corrected_timestamp <= last_timestamp_lidar)
     {
-        ROS_PRINT_ERROR("lidar loop back, clear buffer");
-        lidar_buffer.clear();
+        ROS_PRINT_WARN("drop non-monotonic lidar stamp: raw=%.9f corrected=%.9f last=%.9f",
+                       raw_timestamp, corrected_timestamp, last_timestamp_lidar);
+        mtx_buffer.unlock();
+        return;
     }
-    last_timestamp_lidar = stamp_sec;
+    last_raw_timestamp_lidar = raw_timestamp;
+    last_timestamp_lidar = corrected_timestamp;
 
     if (!time_sync_en && abs(last_timestamp_imu - last_timestamp_lidar) > 10.0 && !imu_buffer.empty() && !lidar_buffer.empty() )
     {
@@ -574,7 +586,7 @@ void livox_pcl_cbk(const LivoxCustomMsgConstPtr &msg)
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
-    time_buffer.push_back(last_timestamp_lidar);
+    time_buffer.push_back(corrected_timestamp);
     
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
@@ -594,30 +606,44 @@ void imu_cbk(const ImuMsgConstPtr &msg_in)
     {
         msg->header.stamp = get_ros_time(timediff_lidar_wrt_imu + msg_in_stamp_sec);
     }
-    double timestamp = get_ros_time_sec(msg->header.stamp);
+    const double raw_timestamp = get_ros_time_sec(msg->header.stamp);
 
     mtx_buffer.lock();
-
-    if (timestamp < last_timestamp_imu)
+    double timestamp = raw_timestamp;
+    const bool raw_rollback = last_raw_timestamp_imu >= 0.0 &&
+                              raw_timestamp < last_raw_timestamp_imu;
+    const double rollback_sec = raw_rollback
+        ? last_raw_timestamp_imu - raw_timestamp : 0.0;
+    if (time_repair && !repair_timestamp(raw_timestamp, imu_dt,
+                                         imu_timestamp_offset_sec,
+                                         last_raw_timestamp_imu,
+                                         last_timestamp_imu, timestamp))
     {
-        ROS_PRINT_WARN("imu loop back, clear buffer");
-        imu_buffer.clear();
+        ROS_PRINT_WARN("drop non-monotonic imu stamp: raw=%.9f corrected=%.9f last=%.9f",
+                       raw_timestamp, timestamp, last_timestamp_imu);
+        mtx_buffer.unlock();
+        return;
     }
-
-    last_timestamp_imu = timestamp;
+    if (!time_repair) {
+        last_raw_timestamp_imu = raw_timestamp;
+        last_timestamp_imu = raw_timestamp;
+        timestamp = raw_timestamp;
+    }
+    if (raw_rollback && time_repair) {
+        ROS_PRINT_WARN(
+            "repair imu timestamp rollback: raw_back=%.6f s offset=%+.6f s corrected=%.9f",
+            rollback_sec, imu_timestamp_offset_sec, timestamp);
+    }
+    msg->header.stamp = get_ros_time(timestamp);
 
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
 
-    // Feed the high-frequency integrator with raw samples. Only the
+    // Feed the high-frequency integrator with repaired samples. Only the
     // timestamped ring is written here; the propagation itself runs in the
     // publish thread, so this stays cheap even when callbacks are batched.
     {
         std::lock_guard<std::mutex> lock(hf_base.mtx);
-        if (!hf_base.imu_samples.empty() &&
-            timestamp < hf_base.imu_samples.back().timestamp) {
-            hf_base.imu_samples.clear();   // time loopback
-        }
         ImuRawSample sample;
         sample.timestamp = timestamp;
         sample.gyro << msg->angular_velocity.x,
@@ -1379,6 +1405,8 @@ int main(int argc, char** argv)
     rosparam_get("mapping/gyr_cov", gyr_cov, 0.1);
     rosparam_get("mapping/acc_cov", acc_cov, 0.1);
     rosparam_get("mapping/b_gyr_cov", b_gyr_cov, 0.0001);
+    rosparam_get("mapping/imu_dt", imu_dt, 1.0 / imu_nominal_rate_hz);
+    rosparam_get("mapping/timeRepair", time_repair, true);
     rosparam_get("mapping/b_acc_cov", b_acc_cov, 0.0001);
     rosparam_get("orientation_observation/topic", orientation_topic,
                  std::string("/external_imu/data_raw"));
@@ -1422,6 +1450,11 @@ int main(int argc, char** argv)
     if (!std::isfinite(imu_nominal_rate_hz) || imu_nominal_rate_hz <= 0.0) {
         ROS_PRINT_WARN("common/imu_nominal_rate_hz must be > 0; forcing 200 Hz.");
         imu_nominal_rate_hz = 200.0;
+    }
+    if (!std::isfinite(imu_dt) || imu_dt <= 0.0) {
+        ROS_PRINT_WARN("mapping/imu_dt must be > 0; using nominal IMU period %.6f s.",
+                       1.0 / imu_nominal_rate_hz);
+        imu_dt = 1.0 / imu_nominal_rate_hz;
     }
     if (imu_orientation_stddev_deg.size() != 3 ||
         !is_finite_vector(imu_orientation_stddev_deg) ||

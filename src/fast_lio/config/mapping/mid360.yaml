@@ -77,6 +77,8 @@ mapping:
     gyr_cov: 0.1
     b_acc_cov: 0.0001
     b_gyr_cov: 0.0001
+    imu_dt: 0.005                  # nominal internal IMU period (200 Hz)
+    timeRepair: true               # repair device-clock rollback with an accumulated offset
     fov_degree: 360.0
     det_range: 100.0             # m
     extrinsic_est_en: false      # keep false to use the official fixed MID-360 transform
