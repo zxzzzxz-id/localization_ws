@@ -17,7 +17,9 @@ common:
 orientation_observation:
     enable: true
     topic: "/imu/data"
-    stddev_deg: [3.0, 3.0, 10.0]
+    # Moderate tightening: covariance is reduced without making dynamic samples
+    # with NIS around 6 immediately fail the 16.27 gate.
+    stddev_deg: [2.5, 2.5, 8.0]
     gate_chi2: 16.27
     use_message_covariance: false
     # R_external^internal: maps internal-IMU vectors into external-IMU vectors.
