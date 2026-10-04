@@ -48,7 +48,9 @@ class ImuProcess
   void configure_orientation_observation(bool enabled, const V3D &stddev_rad,
                                          double gate_chi2,
                                          bool use_message_covariance,
-                                         const M3D &R_external_from_internal);
+                                         const M3D &R_external_from_internal,
+                                         const M3D &R_robot_in_internal,
+                                         double nominal_rate_hz);
   void ResetOrientationReference();
   void RebaseWorldFrame(const M3D &rotation_new_from_old);
 
@@ -103,7 +105,9 @@ class ImuProcess
   double orientation_gate_chi2_ = 16.27;
   M3D    R_odom_from_navigation_ = Eye3d;
   M3D    R_external_from_internal_ = Eye3d;
+  M3D    R_robot_in_internal_ = Eye3d;
   std::size_t orientation_rejection_count_ = 0;
+  std::size_t orientation_rejection_log_stride_ = 200;
 };
 
 ImuProcess::ImuProcess()
@@ -148,13 +152,18 @@ void ImuProcess::RebaseWorldFrame(const M3D &rotation_new_from_old)
 
 void ImuProcess::configure_orientation_observation(
     bool enabled, const V3D &stddev_rad, double gate_chi2,
-    bool use_message_covariance, const M3D &R_external_from_internal)
+    bool use_message_covariance, const M3D &R_external_from_internal,
+    const M3D &R_robot_in_internal,
+    double nominal_rate_hz)
 {
   orientation_observation_enabled_ = enabled;
   orientation_stddev_rad_ = stddev_rad;
   orientation_gate_chi2_ = gate_chi2;
   orientation_use_message_covariance_ = use_message_covariance;
   R_external_from_internal_ = R_external_from_internal;
+  R_robot_in_internal_ = R_robot_in_internal;
+  orientation_rejection_log_stride_ = std::max<std::size_t>(
+      1, static_cast<std::size_t>(std::llround(nominal_rate_hz)));
 }
 
 void ImuProcess::ResetOrientationReference()
@@ -250,17 +259,18 @@ bool ImuProcess::UpdateOrientationObservation(
         now - last_log_time < std::chrono::seconds(1))
       return;
     last_log_time = now;
-    const V3D raw_rpy_deg = rotation_to_rpy_deg(q_navigation_from_imu.toRotationMatrix());
-    const V3D transformed_rpy_deg = rotation_to_rpy_deg(R_measurement);
-    const V3D filter_rpy_deg = rotation_to_rpy_deg(filter_rotation);
+    const V3D observation_robot_rpy_deg =
+        rotation_to_rpy_deg(R_measurement * R_robot_in_internal_);
+    const V3D filter_robot_rpy_deg =
+        rotation_to_rpy_deg(filter_rotation * R_robot_in_internal_);
     ROS_PRINT_INFO(
-        "IMU RPY compare [%s] raw(nav)=(%.2f, %.2f, %.2f) deg "
-        "transformed(odom)=(%.2f, %.2f, %.2f) deg "
-        "fastlio(odom->imu)=(%.2f, %.2f, %.2f) deg NIS=%.3f",
+        "IMU RPY compare [%s] observation(odom->base_link)="
+        "(%.2f, %.2f, %.2f) deg fastlio(odom->base_link)="
+        "(%.2f, %.2f, %.2f) deg NIS=%.3f",
         status,
-        raw_rpy_deg.x(), raw_rpy_deg.y(), raw_rpy_deg.z(),
-        transformed_rpy_deg.x(), transformed_rpy_deg.y(), transformed_rpy_deg.z(),
-        filter_rpy_deg.x(), filter_rpy_deg.y(), filter_rpy_deg.z(), nis);
+        observation_robot_rpy_deg.x(), observation_robot_rpy_deg.y(),
+        observation_robot_rpy_deg.z(), filter_robot_rpy_deg.x(),
+        filter_robot_rpy_deg.y(), filter_robot_rpy_deg.z(), nis);
   };
   M3D measurement_covariance = orientation_stddev_rad_.array().square().matrix().asDiagonal();
   if (orientation_use_message_covariance_) {
@@ -287,7 +297,8 @@ bool ImuProcess::UpdateOrientationObservation(
   if (!std::isfinite(nis) || nis > orientation_gate_chi2_) {
     ++orientation_rejection_count_;
     maybe_log_orientation("rejected", nis, R_odom_from_imu);
-    if (orientation_rejection_count_ == 1 || orientation_rejection_count_ % 200 == 0)
+    if (orientation_rejection_count_ == 1 ||
+        orientation_rejection_count_ % orientation_rejection_log_stride_ == 0)
       ROS_PRINT_WARN("Rejected IMU orientation: NIS=%.3f gate=%.3f (rejected=%zu).",
                      nis, orientation_gate_chi2_, orientation_rejection_count_);
     return false;

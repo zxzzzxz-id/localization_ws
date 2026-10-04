@@ -1,0 +1,77 @@
+# 外置 IMU 配置。
+# 两种积分模式都会从本文件读取外置 IMU 姿态观测参数：
+#   livox    -> /livox/imu 负责积分，/imu/data 的四元数负责姿态观测；
+#   external -> /imu/data 同时负责积分和姿态观测。
+# 只有 external 模式会叠加 common、frames、mapping 和 sensor_extrinsic。
+
+common:
+    imu_source: "external"
+    imu_topic: "/imu/data"
+    # 外置 IMU 实际输出频率。时间回退修复步长和 /OdometryHighFreq
+    # 发布周期均由该参数自动计算；500 Hz 对应 0.002 s。
+    imu_nominal_rate_hz: 500.0
+    time_sync_en: false
+    # corrected_imu_stamp = input_imu_stamp - time_offset_lidar_to_imu
+    # 雷达和外置 IMU 已使用同一硬件时钟时保持 0.0。
+    time_offset_lidar_to_imu: 0.0
+    imu_time_sync_verified: true
+
+frames:
+    imu: "external_imu_link"
+
+mapping:
+    # 外置 IMU 的过程噪声初值，需要结合 500 Hz 实测数据继续标定。
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    timeRepair: true
+    extrinsic_est_en: false
+
+diagnostics:
+    # 记录每个 IMU/雷达输入的原始、修正后、上一帧和接收时刻。
+    # 500 Hz 下建议写 CSV，不要把每帧内容打印到终端。
+    timestamp_trace_en: true
+    timestamp_trace_path: "/tmp/fast_lio_timestamp_trace.csv"
+    timestamp_trace_flush_every: 100
+
+# 外置 IMU 同一条 sensor_msgs/Imu 消息同时用于传播和姿态观测。
+# 程序会复用传播回调中已经完成时间修复的消息，不会重复订阅该话题。
+orientation_observation:
+    enable: true
+    topic: "/imu/data"
+    # 原始四元数输出频率；用于描述输入频率。
+    nominal_rate_hz: 500.0
+    # 实际进入卡尔曼姿态更新的频率。livox 模式与 200 Hz 内置 IMU
+    # 传播频率对齐，external 模式保留每个 500 Hz 外置 IMU 样本。
+    update_rate_hz:
+        livox: 200.0
+        external: 500.0
+    # 代码使用 R_navigation_from_internal =
+    # R_navigation_from_external * R_external_from_internal。
+    # launch 根据积分来源选择下面一组矩阵，并映射到程序参数
+    # orientation_observation/external_to_internal_R。
+    frame_rotation:
+        # external 模式：积分与四元数来自同一个外置 IMU 机体系。
+        external: [1.0, 0.0, 0.0,
+                   0.0, 1.0, 0.0,
+                   0.0, 0.0, 1.0]
+        # livox 模式：MID-360 内置 IMU 轴与点云轴一致。标定矩阵是
+        # R_external_from_lidar，因此也就是 R_external_from_livox_imu。
+        livox: [-0.023660,  0.999634, -0.013080,
+                 0.014667,  0.013429,  0.999802,
+                 0.999612,  0.023464, -0.014979]
+    stddev_deg: [2.5, 2.5, 8.0]
+    gate_chi2: 16.27
+    # 当前驱动在协方差未知时填 0，因此继续使用上面的固定标准差。
+    use_message_covariance: false
+
+# 标定结果：T_imu^lidar，将外置 IMU 坐标转换到雷达点云坐标系：
+# p^lidar = R_imu^lidar * p^imu + t_imu^lidar。
+# 矩阵按 YAML 行优先存储，平移单位为米。
+sensor_extrinsic:
+    calibrated: true
+    imu_in_lidar_R:  [-0.023660,  0.014667,  0.999612,
+                      0.999634,  0.013429,  0.023464,
+                     -0.013080,  0.999802, -0.014979]
+    imu_in_lidar_T: [0.048699, -0.049579, -0.099810]
