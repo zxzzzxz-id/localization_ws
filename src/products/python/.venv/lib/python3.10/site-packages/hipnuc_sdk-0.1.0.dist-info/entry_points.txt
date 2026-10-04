@@ -1,2 +1,0 @@
-[console_scripts]
-hihost = hipnuc.cli:main
