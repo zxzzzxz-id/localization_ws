@@ -7,6 +7,7 @@ calibration_logs/
 .codex/
 .vscode
 .dsh
+git_backup/
 
 # Local editor and OS noise.
 .DS_Store
