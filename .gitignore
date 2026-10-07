@@ -20,3 +20,13 @@ __pycache__/
 .venv/
 dist/
 *.egg-info/
+
+# 大型媒体与数据集文件：请勿提交，历史上曾误提交导致仓库膨胀到 200MB+
+# 确需提交请用 git add -f 显式覆盖。
+*.gif
+*.pdf
+*.pcd
+*.bag
+*.db3
+*.mcap
+*.npz
