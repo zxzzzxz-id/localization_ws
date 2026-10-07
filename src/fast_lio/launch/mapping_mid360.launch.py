@@ -27,51 +27,14 @@ def flatten_yaml(path: Path) -> dict:
     return result
 
 
-def apply_imu_mode(params: dict, external_params: dict) -> None:
-    imu_source = params.get("common/imu_source", "livox")
-    if imu_source not in ("livox", "external"):
-        raise RuntimeError(
-            f"Unsupported common/imu_source in mid360.yaml: {imu_source}")
-
-    rotation_prefix = "orientation_observation/frame_rotation/"
-    rotation_key = f"{rotation_prefix}{imu_source}"
-    update_rate_prefix = "orientation_observation/update_rate_hz/"
-    update_rate_key = f"{update_rate_prefix}{imu_source}"
-    try:
-        orientation_rotation = external_params[rotation_key]
-        orientation_update_rate = external_params[update_rate_key]
-    except KeyError as error:
-        raise RuntimeError(
-            f"Missing mode-specific orientation parameter {error.args[0]} "
-            "in external_imu.yaml") from error
-
-    # Mode-specific entries are launch-only choices, not node parameters.
-    runtime_external_params = {
-        key: value for key, value in external_params.items()
-        if not key.startswith(rotation_prefix)
-        and not key.startswith(update_rate_prefix)
-    }
-    if imu_source == "external":
-        params.update(runtime_external_params)
-    else:
-        # In livox mode retain MID-360 propagation/extrinsic parameters and only
-        # enable the external quaternion observation.
-        params.update({
-            key: value for key, value in runtime_external_params.items()
-            if key.startswith("orientation_observation/")
-        })
-    params["orientation_observation/external_to_internal_R"] = \
-        orientation_rotation
-    params["orientation_observation/update_rate_hz"] = \
-        orientation_update_rate
-
-
 def generate_launch_description():
     package_dir = Path(get_package_share_directory("fast_lio"))
     params = flatten_yaml(package_dir / "config" / "mapping" / "mid360.yaml")
-    external_params = flatten_yaml(
-        package_dir / "config" / "imu" / "external_imu.yaml")
-    apply_imu_mode(params, external_params)
+    imu_source = params.get("common/imu_source", "livox")
+    if imu_source == "external":
+        params.update(flatten_yaml(package_dir / "config" / "imu" / "external_1000hz.yaml"))
+    elif imu_source != "livox":
+        raise RuntimeError(f"Unsupported common/imu_source in mid360.yaml: {imu_source}")
 
     return LaunchDescription([
         DeclareLaunchArgument("use_rviz", default_value="true"),

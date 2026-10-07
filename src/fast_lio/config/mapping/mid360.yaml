@@ -1,9 +1,8 @@
 common:
-    # 唯一的 IMU 模式切换接口：
-    # livox   -> 使用本文件中的 MID-360 内置 IMU 参数积分（200 Hz），同时使用
-    #            config/imu/external_imu.yaml 中的外置 IMU 四元数做姿态观测；
-    # external -> 自动叠加 config/imu/external_imu.yaml，使用外置 IMU 积分及姿态观测。
-    imu_source: "external"
+    # IMU source switch used by mapping_mid360.launch.py and reloc_mid360.launch.py.
+    # livox: use the MID-360 built-in IMU below.
+    # external: keep this file's other settings, then overlay config/imu/external_1000hz.yaml.
+    imu_source: "livox"
     lid_topic: "/livox/lidar"
     imu_topic: "/livox/imu"
     imu_nominal_rate_hz: 200.0
@@ -12,6 +11,23 @@ common:
     # Keep 0.0 when LiDAR and IMU header.stamp already share the same hardware clock.
     time_offset_lidar_to_imu: 0.0
     imu_time_sync_verified: true
+
+# Propagation remains on the built-in MID-360 IMU. The external IMU below is
+# subscribed only as an attitude observation source.
+orientation_observation:
+    enable: true
+    topic: "/imu/data"
+    # Moderate tightening: covariance is reduced without making dynamic samples
+    # with NIS around 6 immediately fail the 16.27 gate.
+    stddev_deg: [2.5, 2.5, 8.0]
+    gate_chi2: 16.27
+    use_message_covariance: false
+    # R_external^internal: maps internal-IMU vectors into external-IMU vectors.
+    # This is the calibrated LiDAR -> external-IMU rotation directly because
+    # the MID-360 built-in IMU axes are aligned with the LiDAR point-cloud axes.
+    external_to_internal_R: [-0.023660,  0.999634, -0.013080,
+                               0.014667,  0.013429,  0.999802,
+                               0.999612,  0.023464, -0.014979]
 
 # FAST-LIO runtime/filter parameters.
 feature_extract_enable: false
@@ -63,15 +79,11 @@ mapping:
     gyr_cov: 0.1
     b_acc_cov: 0.0001
     b_gyr_cov: 0.0001
+    imu_dt: 0.005                  # nominal internal IMU period (200 Hz)
     timeRepair: true               # repair device-clock rollback with an accumulated offset
     fov_degree: 360.0
     det_range: 100.0             # m
     extrinsic_est_en: false      # keep false to use the official fixed MID-360 transform
-
-diagnostics:
-    timestamp_trace_en: false
-    timestamp_trace_path: "/tmp/fast_lio_timestamp_trace.csv"
-    timestamp_trace_flush_every: 100
 
 # Convention: T_B^A is the pose of B relative to A and maps p^B to p^A.
 # T_imu^lidar from the Livox MID-360 documentation:
@@ -93,10 +105,10 @@ sensor_extrinsic:
 # robot_description/config/measurement_params_real.yaml 导出的 URDF（仅可视化），
 # 两者数值应保持一致，模型才不会偏。
 robot_extrinsic:
-  lidar_to_robot_R: [ 1.0, 0.0, 0.0,
-                      0.0, 1.0, 0.0,
+  lidar_to_robot_R: [ 0.0, 1.0, 0.0,
+                     -1.0, 0.0, 0.0,
                       0.0, 0.0, 1.0]
-  lidar_to_robot_T: [0.0, 0.0, 0.0]
+  lidar_to_robot_T: [-0.276324, 0.0, 0.50]
 
 publish:
     path_en: true

@@ -1,0 +1,46 @@
+common:
+    imu_source: "external"
+    imu_topic: "/external_imu/data_raw"
+    imu_nominal_rate_hz: 200.0
+    time_sync_en: false
+    # FAST-LIO applies: corrected_imu_stamp = input_imu_stamp - this value.
+    # Set this only after confirming the LiDAR and external IMU header.stamp domains.
+    time_offset_lidar_to_imu: 0.0
+    imu_time_sync_verified: false
+
+frames:
+    imu: "external_imu_link"
+
+mapping:
+    # Initial process-noise values; tune them from measured 200 Hz data.
+    # The calibrated LiDAR/IMU rigid transform is configured below.
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    extrinsic_est_en: false
+
+# HiPNUC quaternion: body -> navigation (device must output ENU).
+# The first valid sample captures navigation -> odom frame alignment.
+orientation_observation:
+    enable: true
+    topic: "/external_imu/data_raw"
+    external_to_internal_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    # Conservative because AHRS attitude reuses propagation gyro/accelerometer.
+    # Moderate tightening: covariance is reduced without making dynamic samples
+    # with NIS around 6 immediately fail the 16.27 gate.
+    stddev_deg: [2.5, 2.5, 8.0]
+    gate_chi2: 16.27              # 3 DoF, approximately 99.9% acceptance
+    # Current driver uses zeros when covariance is unknown.
+    use_message_covariance: false
+
+# Convention: T_B^A maps p^B to p^A.
+# T_imu^lidar maps external IMU-frame points into the LiDAR frame:
+# p^lidar = R_imu^lidar * p^imu + t_imu^lidar.
+# R is row-major; T is meters. Identity/zero is only an uncalibrated placeholder.
+sensor_extrinsic:
+    calibrated: true
+    imu_in_lidar_R:   [-0.023660,  0.999634, -0.013080 ,
+                       0.014667, 0.013429 , 0.999802,
+                       0.999612 , 0.023464 ,-0.014979]
+    imu_in_lidar_T: [0.049408,  0.099742, -0.049012]
