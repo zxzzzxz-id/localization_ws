@@ -1,0 +1,64 @@
+# ==============================================================================
+# batch-LIO
+# ==============================================================================
+
+# ---------------------------------------------------------------- runtime output
+# CMakeLists.txt bakes ROOT_DIR to the *source* directory, so the node drops its
+# output into the checkout:
+#   Log/pos_log.txt     runtime_pos_log_enable:=true   (src/laserMapping.cpp)
+#   PCD/scans_*.pcd     pcd_save.pcd_save_en:=true
+# and scripts/run_lio.sh, scripts/ablations.sh write run/out/<case>/.
+Log/
+PCD/
+run/
+
+# ------------------------------------------------------- data files / point clouds
+*.pcd
+*.ply
+*.bag
+*.db3
+*.mcap
+bags/
+
+# ------------------------------------------------------------- ROS 2 / colcon
+build/
+install/
+log/
+logs/
+.colcon/
+compile_commands.json
+
+# in-source cmake leftovers
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+CTestTestfile.cmake
+cmake_install.cmake
+Testing/
+/Makefile
+cmake-build-*/
+
+# ----------------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# -------------------------------------------------------------- editors / system
+# Shared VS Code configs under include/ are tracked on purpose.
+.idea/
+**/.vscode/*
+!**/.vscode/settings.json
+!**/.vscode/c_cpp_properties.json
+!**/.vscode/extensions.json
+*.code-workspace
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+*.orig
+*.rej
+*.bak

@@ -1,0 +1,5 @@
+# loam_livox.rviz is shared and tracked; only ignore local autosaves/backups
+# that rviz drops next to it.
+*.rviz~
+*.rviz.autosave
+*.rviz.bak
