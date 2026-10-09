@@ -10,6 +10,8 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <chrono>
+#include <cmath>
 #include "li_initialization.h"
 #include <malloc.h>
 #include <omp.h>
@@ -284,6 +286,36 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     set_posestamp(odomAftMapped.pose.pose);
 
     pubOdomAftMapped->publish(odomAftMapped);
+
+    if (odom_log_interval_sec > 0.0)
+    {
+        static auto last_log_time = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (last_log_time.time_since_epoch().count() == 0 ||
+            now - last_log_time >= std::chrono::duration<double>(odom_log_interval_sec))
+        {
+            const auto &position = odomAftMapped.pose.pose.position;
+            const auto &orientation = odomAftMapped.pose.pose.orientation;
+            const Eigen::Quaterniond quaternion(
+                orientation.w, orientation.x, orientation.y, orientation.z);
+            const Eigen::Matrix3d rotation = quaternion.toRotationMatrix();
+            const double yaw_rad = std::atan2(rotation(1, 0), rotation(0, 0));
+            const double pitch_rad = std::atan2(
+                -rotation(2, 0), std::hypot(rotation(0, 0), rotation(1, 0)));
+            const double roll_rad = std::atan2(rotation(2, 1), rotation(2, 2));
+            constexpr double rad_to_deg = 180.0 / 3.14159265358979323846;
+
+            RCLCPP_INFO(
+                rclcpp::get_logger("laserMapping"),
+                "odom[%s -> %s] xyz=(%.3f, %.3f, %.3f) m "
+                "rpy=(%.2f, %.2f, %.2f) deg",
+                odomAftMapped.header.frame_id.c_str(),
+                odomAftMapped.child_frame_id.c_str(),
+                position.x, position.y, position.z,
+                roll_rad * rad_to_deg, pitch_rad * rad_to_deg, yaw_rad * rad_to_deg);
+            last_log_time = now;
+        }
+    }
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.stamp = odomAftMapped.header.stamp;

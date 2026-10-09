@@ -1,5 +1,6 @@
 /**:
   ros__parameters:
+    filter_size_surf: 0.5 # voxel leaf size for per-scan surface downsampling, in meters
     common:
         lid_topic:  "/livox/lidar" 
         imu_topic:  "/livox/imu" 
@@ -49,6 +50,9 @@
         path_en: true                 # false: close the path output
         scan_publish_en: true         # false: close all the point cloud output
         scan_bodyframe_pub_en: false  # true: output the point cloud scans in IMU-body-frame
+
+    diagnostics:
+        odom_log_interval_sec: 1.0   # print odometry XYZ/RPY to terminal; 0 disables
     
     pcd_save:
         pcd_save_en: false
