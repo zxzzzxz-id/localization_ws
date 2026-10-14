@@ -31,6 +31,8 @@ def generate_launch_description():
     package_dir = Path(get_package_share_directory("fast_lio"))
     params = flatten_yaml(package_dir / "config" / "mapping" / "mid360.yaml")
     params.update(flatten_yaml(package_dir / "config" / "reloc" / "mid360.yaml"))
+    # relocalization runs should not write a new map when fastlio_mapping exits.
+    params["pcd_save/pcd_save_en"] = False
     relocalization_params = str(
         package_dir / "config" / "reloc" / "relocalization.yaml")
 

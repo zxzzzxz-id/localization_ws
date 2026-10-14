@@ -91,7 +91,7 @@ publish:
     effect_pub_en: false
 
 pcd_save:
-    pcd_save_en: true
+    pcd_save_en: false 
     interval: -1                 # -1: save accumulated global map as PCD/scans.pcd when Ctrl+C stops mapping.
                                  # >0: save every N LiDAR frames; final partial batch is also saved on exit.
 
