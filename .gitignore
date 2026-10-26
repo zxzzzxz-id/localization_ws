@@ -27,6 +27,7 @@ compile_commands.json
 *.pcd
 
 # ROS 录包与日志
+/rosbag_home/
 *.bag
 *.bag.active
 *.db3
