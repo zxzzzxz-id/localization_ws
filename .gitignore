@@ -1,0 +1,63 @@
+# ROS 2 / colcon 构建产物与运行环境
+/build/
+/install/
+/log/
+/.ros/
+
+# CMake 缓存与编译产物
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+# 驱动随源码提供的 Livox SDK 库需要提交
+!/src/livox_ros_driver2/lib/*.so
+!/src/livox_ros_driver2/lib/*.so.*
+
+# 点云地图、备份与 FAST-LIO 调试输出
+/PCD_back/
+/src/fast_lio/PCD/*
+!/src/fast_lio/PCD/.gitkeep
+/src/fast_lio/Log/
+*.pcd
+
+# ROS 录包与日志
+*.bag
+*.bag.active
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+*.mcap.active
+*.log
+
+# Python 缓存与本地虚拟环境
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/.venv/
+/venv/
+
+# 编辑器与本机工具配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+/.agents/
+/.codex/
+/.aws/
+
+# 系统杂项与崩溃转储
+.DS_Store
+Thumbs.db
+/core
+/core.[0-9]*
