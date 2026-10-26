@@ -61,3 +61,8 @@ __pycache__/
 Thumbs.db
 /core
 /core.[0-9]*
+
+# Workspace rename: preserved local artifacts from the old absolute path
+/.pre_rename_build/
+/.pre_rename_install/
+/.pre_rename_log/
